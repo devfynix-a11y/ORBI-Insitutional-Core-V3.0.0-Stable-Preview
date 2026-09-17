@@ -108,6 +108,18 @@ export class GatewayPaymentIntentService {
     if (error) throw new Error('GATEWAY_EVENT_DELIVERY_RECORD_FAILED');
   }
 
+  async simulateSandbox(input: { intentId: string; serviceCode: string; reference: string; operation: string; scenario: 'success'|'decline'|'timeout'|'requires_action'; amount: number; currency: string; requestPayload: Record<string, unknown> }) {
+    const sb = getAdminSupabase();
+    if (!sb) throw new Error('SERVICE_ROLE_REQUIRED');
+    const { data, error } = await sb.rpc('simulate_sandbox_payment_v1', {
+      p_service_code: input.serviceCode, p_intent_id: input.intentId,
+      p_reference: input.reference, p_operation: input.operation, p_scenario: input.scenario,
+      p_request_hash: this.hashRequest(input.requestPayload), p_amount: input.amount, p_currency: input.currency,
+    });
+    if (error) throw new Error(String(error.message || '').match(/SANDBOX_[A-Z0-9_]+/)?.[0] || 'SANDBOX_SIMULATION_FAILED');
+    return data as ServicePaymentCoreEvent & { environment: 'sandbox'; scenario: string; simulation: true; replayed: boolean };
+  }
+
   async listPendingChallengesForUser(userId: string) {
     const sb = getAdminSupabase();
     if (!sb) throw new Error('SERVICE_ROLE_REQUIRED');
@@ -443,6 +455,8 @@ export class GatewayPaymentIntentService {
     const nonce = crypto.randomUUID();
     const requestId = crypto.randomUUID();
     const bodySha256 = this.hashRequest(body as Record<string, unknown>);
+    const environment = String(process.env.ORBI_RUNTIME_ENVIRONMENT || '').toLowerCase();
+    if (!['sandbox','live'].includes(environment)) throw new Error('ORBI_RUNTIME_ENVIRONMENT_NOT_CONFIGURED');
     const canonicalPayload = [
       method.toUpperCase(),
       path,
@@ -451,6 +465,7 @@ export class GatewayPaymentIntentService {
       timestamp,
       nonce,
       requestId,
+      environment,
       bodySha256,
     ].join('\n');
     const signature = crypto.createHmac('sha256', signingSecret).update(canonicalPayload).digest('hex');
@@ -461,6 +476,7 @@ export class GatewayPaymentIntentService {
       'x-worker-request-id': requestId,
       'x-worker-timestamp': timestamp,
       'x-worker-nonce': nonce,
+      'x-orbi-environment': environment,
       'x-worker-signature': signature,
       'x-worker-key-id': process.env.WORKER_KEY_ID || 'orbi-core-v1',
     };

@@ -20,3 +20,9 @@ test('mobile GraphQL keeps mobile query limits capped', () => {
   assert.match(routeSource, /MAX_ESCROW_LIMIT = 50/);
   assert.match(routeSource, /clampLimit/);
 });
+
+test('mobile snapshot isolates optional resolver failures and reports degradation', () => {
+  assert.match(routeSource, /Promise\.allSettled/);
+  assert.match(routeSource, /snapshot_resolver_degraded/);
+  assert.match(routeSource, /degraded: \{ type: JsonScalar \}/);
+});

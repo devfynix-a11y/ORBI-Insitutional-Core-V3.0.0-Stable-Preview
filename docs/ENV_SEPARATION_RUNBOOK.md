@@ -73,3 +73,11 @@ Do not add `DATABASE_URL`, `PAYMENT_GATEWAY_PORTAL_*`, `JWT_SECRET`, worker sign
 - `/v1/portal/snapshot` should return JSON with `success=true` when called through the BFF/operator key.
 - Vercel 502 usually means Gateway route is not deployed or returned non-JSON.
 - Vercel 403 usually means portal operator key does not match the target Gateway environment.
+## Enforced Runtime Boundary
+
+| Environment | Public Core URL | Public Pay Gateway URL | Signed header |
+| --- | --- | --- | --- |
+| Live | `https://api.orbifinancial.com` | `https://pay.orbifinancial.com` | `x-orbi-environment: live` |
+| Sandbox | `https://sandbox-api.orbifinancial.com` | `https://sandbox-pay.orbifinancial.com` | `x-orbi-environment: sandbox` |
+
+The edge overwrites the environment header from the hostname. Internal Core/Gateway requests include the environment inside the HMAC canonical payload. Each receiver compares it with its configured runtime and rejects missing, changed, or cross-environment requests. Core sandbox runs as `core-sandbox` on an isolated Docker network and requires independent database, Valkey, object-storage, worker-signing, and mTLS credentials. Never point `ORBI_CORE_SANDBOX_DATABASE_URL`, `ORBI_CORE_SANDBOX_VALKEY_URL`, or sandbox storage variables at live infrastructure.

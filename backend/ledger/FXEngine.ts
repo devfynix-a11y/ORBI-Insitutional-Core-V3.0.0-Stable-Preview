@@ -91,16 +91,16 @@ export class FXEngine {
         const fixedSpread = ['PIPS', 'FIXED_UNIT'].includes(riskPolicy.spreadMode)
             ? riskPolicy.fixedPips
             : 0;
-        const customerRate = Number(
-            Math.max(
-                baseRate * (1 - spreadMultiplier) - fixedSpread,
-                0,
-            ).toFixed(8),
-        );
+        const bidRate = Number(Math.max(baseRate * (1 - spreadMultiplier) - fixedSpread, 0).toFixed(8));
+        const askRate = Number((baseRate * (1 + spreadMultiplier) + fixedSpread).toFixed(8));
+        const customerRate = bidRate;
         if (customerRate <= 0) throw new Error(`FX_RATE_INVALID:${normalizedFromCurrency}:${normalizedToCurrency}`);
         const marketConvertedAmount = amount * baseRate;
         const rawConvertedAmount = amount * customerRate;
         const spreadAmountInTargetCurrency = marketConvertedAmount - rawConvertedAmount;
+        const quotedMarginAmount = marketConvertedAmount * riskPolicy.marginBps / 10000 + amount * fixedSpread;
+        const quotedRiskBufferAmount = marketConvertedAmount * riskPolicy.riskBufferBps / 10000;
+        const bidAskSpread = askRate - bidRate;
         const fee = 0;
         const feeInTargetCurrency = 0;
         const finalAmount = rawConvertedAmount;
@@ -116,12 +116,15 @@ export class FXEngine {
             baseRate,
             marketRate: baseRate,
             customerRate,
-            bidRate: customerRate,
-            askRate: Number((baseRate * (1 + spreadMultiplier)).toFixed(8)),
+            bidRate,
+            askRate,
+            bidAskSpread: Number(bidAskSpread.toFixed(8)),
             marginBps: riskPolicy.marginBps,
             riskBufferBps: riskPolicy.riskBufferBps,
             protectionBps,
             spreadAmount: Number(spreadAmountInTargetCurrency.toFixed(4)),
+            quotedMarginAmount: Number(quotedMarginAmount.toFixed(4)),
+            quotedRiskBufferAmount: Number(quotedRiskBufferAmount.toFixed(4)),
             spreadCurrency: normalizedToCurrency,
             spreadModel: riskPolicy.spreadMode === 'BPS' ? 'PERCENTAGE_BPS' : riskPolicy.spreadMode,
             fixedPips: riskPolicy.fixedPips,

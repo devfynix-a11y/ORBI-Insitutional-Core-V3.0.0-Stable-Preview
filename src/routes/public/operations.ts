@@ -46,6 +46,120 @@ const ApiGatewayLockReleaseSchema = z.object({
   reason: z.string().trim().min(5).max(500),
 });
 
+const TreasuryWithdrawalRequestSchema = z.object({
+  goalId: z.string().uuid(),
+  amount: z.coerce.number().positive().max(1_000_000_000_000),
+  destinationWalletId: z.string().uuid(),
+  reason: z.string().trim().min(5).max(500),
+});
+
+const TreasuryAutoSweepSchema = z.object({
+  goalId: z.string().uuid(),
+  enabled: z.boolean(),
+  threshold: z.coerce.number().nonnegative().max(1_000_000_000_000),
+  frequency: z.enum(['DAILY', 'WEEKLY', 'MONTHLY']),
+  timezone: z.string().trim().min(3).max(80),
+  nextRunAt: z.string().datetime({ offset: true }),
+  windowMinutes: z.coerce.number().int().min(5).max(1440),
+  reason: z.string().trim().min(10).max(500),
+});
+const OrganizationStatementSchema = z.object({
+  periodStart: z.string().datetime({ offset: true }),
+  periodEnd: z.string().datetime({ offset: true }),
+  timezone: z.string().trim().min(1).max(80).default('Africa/Dar_es_Salaam'),
+  reason: z.string().trim().min(10).max(500),
+});
+const TreasuryAutoSweepReviewSchema = z.object({
+  decision: z.enum(['APPROVE', 'REJECT']), reason: z.string().trim().min(10).max(500),
+});
+
+const TreasuryPolicySchema = z.object({
+  organizationId: z.string().uuid(),
+  currency: z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/),
+  name: z.string().trim().min(3).max(120),
+  description: z.string().trim().max(500).nullable().optional(),
+  minApprovals: z.coerce.number().int().min(2).max(20),
+  maxAmountPerTx: z.coerce.number().positive().max(1_000_000_000_000).nullable().optional(),
+  dailyLimit: z.coerce.number().positive().max(1_000_000_000_000).nullable().optional(),
+  reason: z.string().trim().min(5).max(500),
+});
+const TreasuryApproverChangeSchema = z.object({
+  organizationId: z.string().uuid(), targetUserId: z.string().uuid(),
+  action: z.enum(['ADD', 'REMOVE']), reason: z.string().trim().min(5).max(500),
+});
+const TreasuryApproverReviewSchema = z.object({
+  decision: z.enum(['APPROVE', 'REJECT']), reason: z.string().trim().min(5).max(500),
+});
+const OrganizationInvitationSchema = z.object({
+  email: z.string().trim().email(), organizationId: z.string().uuid(),
+  role: z.enum(['MEMBER', 'MANAGER', 'ACCOUNTANT']),
+  reason: z.string().trim().min(5).max(500).default('Organization membership invitation requested'),
+});
+const OrganizationLinkInvitationSchema = z.object({
+  userId: z.string().uuid(), organizationId: z.string().uuid(),
+  role: z.enum(['MEMBER', 'MANAGER', 'ACCOUNTANT']),
+  reason: z.string().trim().min(5).max(500).default('Organization membership invitation requested'),
+});
+const OrganizationInvitationResponseSchema = z.object({
+  decision: z.enum(['ACCEPT', 'DECLINE']),
+});
+const OrganizationMemberChangeSchema = z.object({
+  targetUserId: z.string().uuid(),
+  action: z.enum(['CHANGE_ROLE', 'REMOVE_MEMBER']),
+  toRole: z.enum(['MEMBER', 'MANAGER', 'ACCOUNTANT']).nullable().optional(),
+  reason: z.string().trim().min(5).max(500),
+}).refine((value) => value.action !== 'CHANGE_ROLE' || Boolean(value.toRole), {
+  message: 'toRole is required for CHANGE_ROLE',
+  path: ['toRole'],
+});
+const OrganizationMemberChangeReviewSchema = z.object({
+  decision: z.enum(['APPROVE', 'REJECT']),
+  reason: z.string().trim().min(5).max(500),
+});
+const OrganizationLeadershipChangeSchema = z.object({
+  targetUserId: z.string().uuid(),
+  action: z.enum(['ADD_ADMIN', 'REMOVE_ADMIN', 'TRANSFER_PRIMARY_ADMIN']),
+  toRole: z.enum(['MEMBER', 'MANAGER', 'ACCOUNTANT']).nullable().optional(),
+  reason: z.string().trim().min(5).max(500),
+});
+const OrganizationLeadershipReviewSchema = z.object({
+  decision: z.enum(['APPROVE', 'REJECT']),
+  reason: z.string().trim().min(5).max(500),
+});
+const OrganizationRecoverySchema = z.object({
+  beneficiaryUserId: z.string().uuid(),
+  incidentReference: z.string().trim().min(8).max(120),
+  reason: z.string().trim().min(10).max(500),
+  evidence: z.record(z.string(), z.unknown()).default({}),
+});
+const OrganizationRecoveryReviewSchema = z.object({
+  decision: z.enum(['APPROVE', 'REJECT']),
+  reason: z.string().trim().min(10).max(500),
+});
+const OrganizationRecoveryContactSchema = z.object({
+  contactUserId: z.string().uuid(),
+  contactType: z.enum(['EMAIL', 'PHONE', 'LEGAL_REPRESENTATIVE']),
+  reason: z.string().trim().min(10).max(500),
+});
+const OrganizationRecoveryContactReviewSchema = z.object({
+  decision: z.enum(['VERIFY', 'REJECT', 'REVOKE']),
+  reason: z.string().trim().min(10).max(500),
+});
+const OrganizationRecoveryContactRevocationSchema = z.object({ reason: z.string().trim().min(10).max(500) });
+const OrganizationReactivationSchema = z.object({
+  targetUserId: z.string().uuid(),
+  reason: z.string().trim().min(10).max(500),
+  evidence: z.object({
+    identityReverified: z.literal(true),
+    credentialResetConfirmed: z.literal(true),
+    incidentClosed: z.literal(true),
+  }).passthrough(),
+});
+const OrganizationReactivationReviewSchema = z.object({
+  decision: z.enum(['APPROVE', 'REJECT']),
+  reason: z.string().trim().min(10).max(500),
+});
+
 const CurrencyCodeSchema = z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/);
 
 const FxCorridorConfigSchema = z.object({
@@ -298,12 +412,20 @@ export const registerOperationsRoutes = (v1: Router, deps: Deps) => {
   });
 
   v1.get('/enterprise/organizations/:id', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
     try {
-      const result = await LogicCore.getOrganizationDetails(req.params.id);
+      const privileged = sessionHasAnyRole(session, ['ADMIN', 'SUPER_ADMIN', 'AUDIT']);
+      const result = await LogicCore.getOrganizationDetails(req.params.id, session.sub, privileged);
       if (result.error) return res.status(404).json({ success: false, error: result.error });
+      if (privileged) {
+        await Audit.log('SECURITY', session.sub, 'ORGANIZATION_PRIVILEGED_READ', {
+          organizationId: req.params.id,
+        });
+      }
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      const status = e.message === 'ORGANIZATION_ACCESS_DENIED' ? 403 : 500;
+      res.status(status).json({ success: false, error: e.message });
     }
   });
 
@@ -314,65 +436,143 @@ export const registerOperationsRoutes = (v1: Router, deps: Deps) => {
       if (result.error) return res.status(400).json({ success: false, error: result.error });
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      const status = e instanceof z.ZodError ? 400 : 500;
+      res.status(status).json({ success: false, error: e.message });
     }
   });
 
   v1.post('/enterprise/organizations/:id/admin-change-requests', authenticate as any, async (req, res) => {
     const session = (req as any).session;
     try {
-      const result = await LogicCore.requestOrganizationAdminChange(req.params.id, req.body, session.sub);
-      if (result.error) return res.status(400).json({ success: false, error: result.error });
+      const input = OrganizationLeadershipChangeSchema.parse(req.body);
+      const result = await LogicCore.requestOrganizationAdminChange(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
     }
   });
 
   v1.post('/enterprise/admin-change-requests/:id/respond', authenticate as any, async (req, res) => {
     const session = (req as any).session;
     try {
-      const result = await LogicCore.respondOrganizationAdminChange(req.params.id, req.body, session.sub);
-      if (result.error) return res.status(400).json({ success: false, error: result.error });
+      const input = OrganizationLeadershipReviewSchema.parse(req.body);
+      const result = await LogicCore.respondOrganizationAdminChange(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
     }
+  });
+
+  v1.post('/enterprise/organizations/:id/recovery-cases', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationRecoverySchema.parse(req.body);
+      const result = await LogicCore.requestOrganizationRecovery(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) {
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
+    }
+  });
+
+  v1.post('/enterprise/organization-recovery-cases/:id/respond', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationRecoveryReviewSchema.parse(req.body);
+      const result = await LogicCore.respondOrganizationRecovery(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) {
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
+    }
+  });
+
+  v1.post('/enterprise/organizations/:id/recovery-contacts', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationRecoveryContactSchema.parse(req.body);
+      const result = await LogicCore.requestOrganizationRecoveryContact(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) { res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message }); }
+  });
+
+  v1.post('/enterprise/organization-recovery-contacts/:id/revoke', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationRecoveryContactRevocationSchema.parse(req.body);
+      const result = await LogicCore.requestOrganizationRecoveryContactRevocation(req.params.id, input.reason, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) { res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message }); }
+  });
+
+  v1.post('/enterprise/organization-recovery-contacts/:id/respond', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationRecoveryContactReviewSchema.parse(req.body);
+      const result = await LogicCore.respondOrganizationRecoveryContact(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) { res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message }); }
+  });
+
+  v1.post('/enterprise/organizations/:id/reactivation-cases', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationReactivationSchema.parse(req.body);
+      const result = await LogicCore.requestOrganizationReactivation(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) { res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message }); }
+  });
+
+  v1.post('/enterprise/organization-reactivation-cases/:id/respond', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationReactivationReviewSchema.parse(req.body);
+      const result = await LogicCore.respondOrganizationReactivation(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) { res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message }); }
   });
 
   v1.post('/enterprise/users/link', authenticate as any, async (req, res) => {
     const session = (req as any).session;
-    const { userId, organizationId, role } = req.body;
     try {
-      const result = await LogicCore.linkUserToOrganization(userId, organizationId, role, session.sub);
+      const { userId, organizationId, role, reason } = OrganizationLinkInvitationSchema.parse(req.body);
+      const result = await LogicCore.linkUserToOrganization(userId, organizationId, role, session.sub, reason);
       if (result.error) return res.status(400).json({ success: false, error: result.error });
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
     }
   });
 
   v1.post('/enterprise/users/invite', authenticate as any, async (req, res) => {
     const session = (req as any).session;
-    const { email, organizationId, role } = req.body;
     try {
-      const result = await LogicCore.inviteUserByEmail(email, organizationId, role, session.sub);
+      const { email, organizationId, role, reason } = OrganizationInvitationSchema.parse(req.body);
+      const result = await LogicCore.inviteUserByEmail(email, organizationId, role, session.sub, reason);
       if (result.error) return res.status(400).json({ success: false, error: result.error });
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
     }
   });
 
   v1.post('/enterprise/treasury/withdraw/request', authenticate as any, async (req, res) => {
     const session = (req as any).session;
-    const { goalId, amount, destinationWalletId, reason } = req.body;
     try {
+      const { goalId, amount, destinationWalletId, reason } = TreasuryWithdrawalRequestSchema.parse(req.body);
       const result = await LogicCore.requestTreasuryWithdrawal(session.sub, goalId, amount, destinationWalletId, reason);
       if (result.error) return res.status(400).json({ success: false, error: result.error });
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      const status = e instanceof z.ZodError ? 400 : 500;
+      res.status(status).json({ success: false, error: e.message });
     }
   });
 
@@ -388,23 +588,36 @@ export const registerOperationsRoutes = (v1: Router, deps: Deps) => {
   });
 
   v1.get('/enterprise/treasury/approvals', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
     const orgId = req.query.orgId as string;
     if (!orgId) return res.status(400).json({ success: false, error: 'MISSING_ORG_ID' });
     try {
-      const result = await LogicCore.getPendingApprovals(orgId);
+      const privileged = sessionHasAnyRole(session, ['ADMIN', 'SUPER_ADMIN', 'AUDIT', 'ACCOUNTANT']);
+      const result = await LogicCore.getPendingApprovals(orgId, session.sub, privileged);
+      if (privileged) {
+        await Audit.log('SECURITY', session.sub, 'ORGANIZATION_TREASURY_PRIVILEGED_READ', {
+          organizationId: orgId,
+        });
+      }
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      const status = e.message === 'ORGANIZATION_ACCESS_DENIED' ? 403 : 500;
+      res.status(status).json({ success: false, error: e.message });
     }
   });
 
   v1.post('/enterprise/treasury/autosweep', authenticate as any, async (req, res) => {
-    const { goalId, enabled, threshold } = req.body;
+    const session = (req as any).session;
     try {
-      const result = await LogicCore.configureAutoSweep(goalId, enabled, threshold);
+      const input = TreasuryAutoSweepSchema.parse(req.body);
+      const privileged = sessionHasAnyRole(session, ['ADMIN', 'SUPER_ADMIN']);
+      const result = await LogicCore.configureAutoSweep(input, session.sub, privileged);
       res.json(result);
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      const status = e instanceof z.ZodError ? 400 :
+        e.message === 'ORGANIZATION_ACCESS_DENIED' ? 403 :
+        e.message === 'ORGANIZATION_RESOURCE_NOT_FOUND' ? 404 : 500;
+      res.status(status).json({ success: false, error: e.message });
     }
   });
 
@@ -418,6 +631,105 @@ export const registerOperationsRoutes = (v1: Router, deps: Deps) => {
       console.warn('[PAYSAFE_ROUTE] escrow list failed', response.body);
       res.status(response.status).json(response.body);
     }
+  });
+
+  v1.post('/enterprise/treasury/autosweep-requests/:requestId/respond', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = TreasuryAutoSweepReviewSchema.parse(req.body);
+      const result = await LogicCore.respondAutoSweepChange(req.params.requestId, input, session.sub);
+      res.json(result);
+    } catch (e: any) {
+      res.status(e instanceof z.ZodError ? 400 : 403).json({ success: false, error: e.message });
+    }
+  });
+
+  v1.post('/enterprise/organization-invitations/:id/respond', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const { decision } = OrganizationInvitationResponseSchema.parse(req.body);
+      const result = await LogicCore.respondOrganizationInvitation(req.params.id, decision, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) {
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
+    }
+  });
+
+  v1.post('/enterprise/organizations/:id/member-changes', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationMemberChangeSchema.parse(req.body);
+      const result = await LogicCore.requestOrganizationMemberChange(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) {
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
+    }
+  });
+
+  v1.post('/enterprise/member-changes/:id/respond', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = OrganizationMemberChangeReviewSchema.parse(req.body);
+      const result = await LogicCore.respondOrganizationMemberChange(req.params.id, input, session.sub);
+      if (result.error) return res.status(409).json({ success: false, error: result.error });
+      res.json(result);
+    } catch (e: any) {
+      res.status(e instanceof z.ZodError ? 400 : 500).json({ success: false, error: e.message });
+    }
+  });
+
+  v1.get('/enterprise/treasury/policy', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    const organizationId = String(req.query.organizationId || '');
+    const currency = String(req.query.currency || 'TZS').trim().toUpperCase();
+    try {
+      const result = await LogicCore.getTreasuryPolicy(organizationId, currency, session.sub);
+      res.json(result);
+    } catch (e: any) {
+      res.status(e.message === 'ORGANIZATION_ACCESS_DENIED' ? 403 : 500).json({ success: false, error: e.message });
+    }
+  });
+
+  v1.put('/enterprise/treasury/policy', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try {
+      const input = TreasuryPolicySchema.parse(req.body);
+      const result = await LogicCore.upsertTreasuryPolicy(input, session.sub);
+      res.json(result);
+    } catch (e: any) {
+      const message = String(e.message || '');
+      const status = e instanceof z.ZodError ? 400 :
+        message.includes('ADMIN_REQUIRED') ? 403 :
+        message.includes('QUORUM_UNAVAILABLE') || message.includes('LIMIT_') ? 409 : 500;
+      res.status(status).json({ success: false, error: message });
+    }
+  });
+  v1.post('/enterprise/treasury/approver-changes', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try { res.json(await LogicCore.requestTreasuryApproverChange(TreasuryApproverChangeSchema.parse(req.body), session.sub)); }
+    catch (e: any) { res.status(e instanceof z.ZodError ? 400 : String(e.message).includes('ADMIN_REQUIRED') ? 403 : 409).json({ success:false,error:e.message }); }
+  });
+  v1.post('/enterprise/treasury/approver-changes/:id/respond', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try { res.json(await LogicCore.respondTreasuryApproverChange(req.params.id, TreasuryApproverReviewSchema.parse(req.body), session.sub)); }
+    catch (e: any) { res.status(e instanceof z.ZodError ? 400 : String(e.message).includes('REVIEWER_REQUIRED') ? 403 : 409).json({ success:false,error:e.message }); }
+  });
+  v1.post('/enterprise/organizations/:id/statements', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try { res.json(await LogicCore.generateOrganizationStatement(req.params.id, OrganizationStatementSchema.parse(req.body), session.sub)); }
+    catch (e: any) { const message=String(e.message||''); res.status(e instanceof z.ZodError?400:message.includes('ACCESS_DENIED')?403:message.includes('PERIOD_INVALID')?400:409).json({success:false,error:message}); }
+  });
+  v1.get('/enterprise/organizations/:id/statements', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try { res.json(await LogicCore.listOrganizationStatements(req.params.id, session.sub)); }
+    catch (e: any) { res.status(String(e.message).includes('ACCESS_DENIED')?403:500).json({success:false,error:e.message}); }
+  });
+  v1.get('/enterprise/organization-statements/:id', authenticate as any, async (req, res) => {
+    const session = (req as any).session;
+    try { res.json(await LogicCore.getOrganizationStatement(req.params.id, session.sub, Number(req.query.offset||0), Number(req.query.limit||100))); }
+    catch (e: any) { res.status(String(e.message).includes('ACCESS_DENIED')?403:String(e.message).includes('NOT_FOUND')?404:400).json({success:false,error:e.message}); }
   });
 
   v1.get('/escrow/:id', authenticate as any, async (req, res) => {
@@ -1092,7 +1404,8 @@ export const registerOperationsRoutes = (v1: Router, deps: Deps) => {
         success: true,
         data: {
           window: '24h',
-          exposure: computeFxExposure(events || []),
+          exposure: computeFxExposure((events || []).filter((row: any) => String(row.status || '').toUpperCase() === 'MATCHED')),
+          pendingQuoteCount: (events || []).filter((row: any) => String(row.status || '').toUpperCase() === 'PENDING').length,
           limits: limits || [],
         },
       });

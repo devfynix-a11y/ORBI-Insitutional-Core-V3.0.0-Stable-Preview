@@ -1,4 +1,11 @@
-import admin from 'firebase-admin';
+import {
+  cert,
+  getApps,
+  initializeApp,
+  type App,
+  type ServiceAccount,
+} from 'firebase-admin/app';
+import { getMessaging, type Message } from 'firebase-admin/messaging';
 
 import { logger } from './logger.js';
 import { getAdminSupabase } from '../../services/supabaseClient.js';
@@ -13,8 +20,14 @@ type PushPayload = {
   requestId?: string;
 };
 
+export type PushDeliveryReceipt = {
+  status: 'sent' | 'unavailable' | 'invalid_token' | 'failed';
+  messageId?: string;
+  errorCode?: string;
+};
+
 class FirebasePushService {
-  private app: admin.app.App | null = null;
+  private app: App | null = null;
   private attemptedInit = false;
 
   private async clearRejectedToken(token: string, requestId?: string) {
@@ -38,7 +51,7 @@ class FirebasePushService {
     }
   }
 
-  private loadServiceAccount(): admin.ServiceAccount | null {
+  private loadServiceAccount(): ServiceAccount | null {
     const rawJson =
       process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim() ||
       process.env.FIREBASE_ADMIN_SDK_JSON?.trim() ||
@@ -57,14 +70,14 @@ class FirebasePushService {
       if (parsed.private_key && typeof parsed.private_key === 'string') {
         parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
       }
-      return parsed as admin.ServiceAccount;
+      return parsed as ServiceAccount;
     } catch (error) {
       pushLogger.error('firebase_push.invalid_service_account_json', {}, error);
       return null;
     }
   }
 
-  private ensureInitialized(): admin.app.App | null {
+  private ensureInitialized(): App | null {
     if (this.app) return this.app;
     if (this.attemptedInit) return null;
     this.attemptedInit = true;
@@ -77,12 +90,11 @@ class FirebasePushService {
       }
 
       const appName = 'orbi-sovereign-backend-push';
-      this.app = admin.apps.find(
-        (candidate): candidate is admin.app.App =>
-          candidate != null && candidate.name === appName,
+      this.app = getApps().find(
+        (candidate): candidate is App => candidate.name === appName,
       ) ??
-        admin.initializeApp(
-          { credential: admin.credential.cert(serviceAccount) },
+        initializeApp(
+          { credential: cert(serviceAccount) },
           appName,
         );
 
@@ -94,13 +106,13 @@ class FirebasePushService {
     }
   }
 
-  async send({ token, title, body, data = {}, requestId }: PushPayload): Promise<boolean> {
+  async sendWithReceipt({ token, title, body, data = {}, requestId }: PushPayload): Promise<PushDeliveryReceipt> {
     const firebaseApp = this.ensureInitialized();
     if (!firebaseApp) {
       pushLogger.warn('firebase_push.send_skipped_unavailable', {
         request_id: requestId,
       });
-      return false;
+      return { status: 'unavailable', errorCode: 'FIREBASE_NOT_CONFIGURED' };
     }
 
     try {
@@ -110,7 +122,7 @@ class FirebasePushService {
         normalizedData[key] = typeof value === 'string' ? value : JSON.stringify(value);
       }
 
-      const message: admin.messaging.Message = {
+      const message: Message = {
         token,
         notification: { title, body },
         data: normalizedData,
@@ -134,12 +146,12 @@ class FirebasePushService {
         },
       };
 
-      const response = await firebaseApp.messaging().send(message);
+      const response = await getMessaging(firebaseApp).send(message);
       pushLogger.info('firebase_push.sent', {
         request_id: requestId,
         message_id: response,
       });
-      return true;
+      return { status: 'sent', messageId: response };
     } catch (error: any) {
       const code = String(error?.code || '');
       pushLogger.error(
@@ -155,9 +167,14 @@ class FirebasePushService {
         code === 'messaging/invalid-registration-token'
       ) {
         await this.clearRejectedToken(token, requestId);
+        return { status: 'invalid_token', errorCode: code };
       }
-      return false;
+      return { status: 'failed', errorCode: code || 'FIREBASE_SEND_FAILED' };
     }
+  }
+
+  async send(payload: PushPayload): Promise<boolean> {
+    return (await this.sendWithReceipt(payload)).status === 'sent';
   }
 }
 

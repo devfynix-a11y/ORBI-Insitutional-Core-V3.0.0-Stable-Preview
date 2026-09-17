@@ -26,6 +26,7 @@ export type MutualTlsIdentity = {
 };
 
 export type InternalRequestIdentity = WorkerIdentity & {
+  environment: 'sandbox' | 'live';
   authMode: InternalRequestAuthMode;
   requestId: string;
   remoteIp: string;
@@ -426,6 +427,7 @@ const createInternalCanonicalPayload = (req: Request, worker: WorkerIdentity, bo
   const timestamp = String(req.get('x-worker-timestamp') || '').trim();
   const nonce = String(req.get('x-worker-nonce') || '').trim();
   const requestId = String(req.get('x-worker-request-id') || '').trim();
+  const environment = String(req.get('x-orbi-environment') || '').trim().toLowerCase();
   return [
     req.method.toUpperCase(),
     req.originalUrl || req.path,
@@ -434,6 +436,7 @@ const createInternalCanonicalPayload = (req: Request, worker: WorkerIdentity, bo
     timestamp,
     nonce,
     requestId,
+    environment,
     bodySha256,
   ].join('\n');
 };
@@ -491,20 +494,24 @@ const verifySignedInternalRequest = async (
   const requestId = String(req.get('x-worker-request-id') || '').trim();
   const signatureHeader = String(req.get('x-worker-signature') || '').trim();
   const keyId = String(req.get('x-worker-key-id') || '').trim() || null;
+  const environment = String(req.get('x-orbi-environment') || '').trim().toLowerCase();
+  const expectedEnvironment = String(process.env.ORBI_RUNTIME_ENVIRONMENT || '').trim().toLowerCase();
   const signingSecret = process.env.WORKER_SIGNING_SECRET || process.env.WORKER_SECRET || '';
 
   if (!signingSecret) {
     return { ok: false, code: 'WORKER_SIGNING_SECRET_NOT_CONFIGURED', status: 500 };
   }
 
-  if (!timestampHeader || !nonce || !requestId || !signatureHeader) {
+  if (!timestampHeader || !nonce || !requestId || !signatureHeader || !['sandbox','live'].includes(environment)) {
     return {
       ok: false,
       code: 'SIGNED_WORKER_HEADERS_REQUIRED',
       status: 401,
-      message: 'Signed internal requests require timestamp, nonce, request id, and signature headers.',
+      message: 'Signed internal requests require timestamp, nonce, request id, environment, and signature headers.',
     };
   }
+  if (!['sandbox','live'].includes(expectedEnvironment)) return { ok: false, code: 'RUNTIME_ENVIRONMENT_NOT_CONFIGURED', status: 500 };
+  if (environment !== expectedEnvironment) return { ok: false, code: 'INTERNAL_ENVIRONMENT_MISMATCH', status: 403 };
 
   const timestampMs = parseTimestamp(timestampHeader);
   if (!timestampMs) {
@@ -535,6 +542,7 @@ const verifySignedInternalRequest = async (
     ok: true,
     identity: {
       ...worker,
+      environment: environment as 'sandbox' | 'live',
       authMode: 'signed-hmac-sha256',
       requestId,
       remoteIp: String(req.ip || ''),
@@ -572,6 +580,7 @@ const verifyLegacyInternalRequest = (
     ok: true,
     identity: {
       ...worker,
+      environment: String(process.env.ORBI_RUNTIME_ENVIRONMENT || 'live').toLowerCase() === 'sandbox' ? 'sandbox' : 'live',
       authMode: 'legacy-shared-secret',
       requestId: String(req.get('x-worker-request-id') || `${worker.id}:${Date.now()}`),
       remoteIp: String(req.ip || ''),
@@ -600,6 +609,7 @@ export const getInternalAuditMetadata = (req: Request): Record<string, unknown> 
 
   return {
     worker_id: identity.id,
+    worker_environment: identity.environment,
     worker_scopes: identity.scopes,
     worker_auth_mode: identity.authMode,
     worker_request_id: identity.requestId,

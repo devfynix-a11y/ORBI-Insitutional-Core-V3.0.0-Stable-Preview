@@ -408,6 +408,10 @@ CEO, ORBI`
             whatsapp?: boolean,
             template?: string,
             eventCode?: string,
+            /** Stable business-event key. Required by governance callers to suppress duplicate delivery. */
+            idempotencyKey?: string,
+            /** Mandatory security/governance notices cannot be disabled by marketing preferences. */
+            mandatory?: boolean,
             variables?: Record<string, any>,
             brand?: NotificationBrandContext | NotificationBrand,
             systemCustomBypass?: boolean,
@@ -419,6 +423,25 @@ CEO, ORBI`
         } = {}
     ): Promise<UserMessage | null> {
         const sb = getAdminSupabase();
+        let id = UUID.generate();
+        const idempotencyKey = String(options.idempotencyKey || '').trim();
+        if (idempotencyKey) {
+            if (!sb) throw new Error('DB_OFFLINE: Cannot safely claim an idempotent notification.');
+            const eventCode = String(options.eventCode || '').trim();
+            if (!eventCode) throw new Error('NOTIFICATION_EVENT_REQUIRED: eventCode is required with idempotencyKey.');
+            const { data: claim, error: claimError } = await sb.rpc('claim_notification_delivery_v1', {
+                p_event_key: idempotencyKey,
+                p_recipient_user_id: userId,
+                p_message_id: id,
+                p_event_code: eventCode,
+            });
+            if (claimError) throw new Error(`NOTIFICATION_CLAIM_FAILED: ${claimError.message}`);
+            if (claim?.message_id) id = String(claim.message_id);
+            if (claim?.acquired !== true) {
+                console.info('[Messaging] Duplicate notification suppressed', { userId, eventCode, idempotencyKey });
+                return null;
+            }
+        }
         
         // Check user profile and preferences before dispatching
         const profile = await this.getUserProfile(userId);
@@ -435,17 +458,16 @@ CEO, ORBI`
             return true;
         };
 
-        if (!isAllowed(category)) {
+        if (!options.mandatory && !isAllowed(category)) {
             console.info(`[Messaging] Skipping notification for ${userId} due to preference settings for category: ${category}`);
             return null;
         }
 
-        const pushAllowed = profile.notif_push !== false;
-        const emailAllowed = profile.notif_email !== false;
+        const pushAllowed = options.mandatory || profile.notif_push !== false;
+        const emailAllowed = options.mandatory || profile.notif_email !== false;
         if (!pushAllowed) options.push = false;
         if (!emailAllowed) options.email = false;
 
-        const id = UUID.generate();
         const refId = id.substring(0, 8).toUpperCase();
         const isTransactional = ['security', 'update', 'info'].includes(category);
         const templatePlan = officialOrbiTalkTemplatePolicy.resolve({
@@ -756,6 +778,20 @@ CEO, ORBI`
         const localMsgs = Storage.getFromDB<UserMessage>('orbi_messages') || [];
         localMsgs.unshift(msg);
         Storage.saveToDB('orbi_messages', localMsgs.slice(0, 50));
+
+        if (sb && idempotencyKey) {
+            const { error: finishError } = await sb.rpc('finish_notification_delivery_v1', {
+                p_event_key: idempotencyKey,
+                p_recipient_user_id: userId,
+                p_status: 'DISPATCHED',
+                p_error: null,
+            });
+            if (finishError) {
+                console.error('[Messaging] Could not finalize notification delivery ledger', {
+                    userId, idempotencyKey, error: finishError.message,
+                });
+            }
+        }
 
         console.info(`[Messaging] Node Signal Dispatched to ${userId}: ${subject}`);
         return msg;

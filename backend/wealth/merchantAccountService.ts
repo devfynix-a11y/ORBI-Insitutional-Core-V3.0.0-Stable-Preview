@@ -1,5 +1,9 @@
 import { getSupabase } from '../supabaseClient.js';
 import { UUID } from '../../services/utils.js';
+import {
+    canAccessMerchantResource,
+    type MerchantResourceAccess,
+} from '../security/ecosystemAuthorization.js';
 
 export class MerchantAccountService {
     
@@ -83,7 +87,7 @@ export class MerchantAccountService {
     /**
      * Get a specific merchant by ID
      */
-    async getMerchantById(merchantId: string) {
+    async getMerchantById(merchantId: string, access: MerchantResourceAccess) {
         const sb = getSupabase();
         if (!sb) return null;
 
@@ -91,18 +95,33 @@ export class MerchantAccountService {
             .from('merchants')
             .select('*, merchant_wallets(*), merchant_settlements(*), merchant_fees(*)')
             .eq('id', merchantId)
-            .single();
+            .maybeSingle();
 
         if (error) throw new Error(error.message);
+        if (!data) throw new Error('MERCHANT_NOT_FOUND');
+        if (!canAccessMerchantResource(data, access)) throw new Error('ACCESS_DENIED');
         return data;
     }
 
     /**
      * Update Merchant Settlement Info
      */
-    async updateSettlementInfo(merchantId: string, data: { bank_name: string, bank_account: string, settlement_schedule?: string }) {
+    async updateSettlementInfo(
+        merchantId: string,
+        data: { bank_name: string, bank_account: string, settlement_schedule?: string },
+        access: MerchantResourceAccess,
+    ) {
         const sb = getSupabase();
         if (!sb) throw new Error("Database not connected");
+
+        const { data: merchant, error: merchantError } = await sb
+            .from('merchants')
+            .select('id, owner_user_id, status')
+            .eq('id', merchantId)
+            .maybeSingle();
+        if (merchantError) throw new Error(merchantError.message);
+        if (!merchant) throw new Error('MERCHANT_NOT_FOUND');
+        if (!canAccessMerchantResource(merchant, access)) throw new Error('ACCESS_DENIED');
 
         // Check if settlement info exists
         const { data: existing } = await sb.from('merchant_settlements').select('id').eq('merchant_id', merchantId).single();

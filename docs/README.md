@@ -1,11 +1,17 @@
 
 # ORBI Sovereign Backend Node (v31.0 Titanium)
 
-This is the **Sovereign Financial Operating System** powering the ORBI ecosystem. It is a headless, banking-grade API node designed to power mobile and desktop financial applications with zero-trust security and atomic ledger integrity.
+This is the headless financial Core powering the ORBI ecosystem. It has a
+strong controlled-production foundation with SQL-authoritative ledger controls.
+External merchant, agent, organization, and developer launch remains subject to
+the readiness and certification gates below; the repository must not be
+described as fully bank-certified until those gates pass.
 
 ## 📚 Documentation
 
 *   **[Documentation Index](./DOCUMENTATION_INDEX.md)**: Canonical map for all maintained docs and merged compatibility files.
+*   **[Ecosystem Readiness And Remaining Slices](./ECOSYSTEM_READINESS_AND_REMAINING_SLICES.md)**: Evidence-based launch verdict and delivery plan for merchants, agents, organizations, developers, and external services.
+*   **[Ecosystem Authorization Inventory](./ECOSYSTEM_AUTHORIZATION_INVENTORY.md)**: Endpoint-level ownership and tenant-isolation audit for the first security slice.
 *   **[ORBI Open Digital Banking And BaaS Roadmap](./ORBI_OPEN_BANKING_BAAS_ROADMAP.md)**: Phased TODO checklist for developer portal, consent, sandbox, webhooks, onboarding, SDKs, reconciliation, risk, control room, and production hardening.
 *   **[ORBI Infrastructure Platform Blueprint](./ORBI_INFRASTRUCTURE_PLATFORM_BLUEPRINT.md)**: ORBI as financial infrastructure for merchants and third parties, including hosted secure UI, payment profiles, consent scopes, PaySafe lifecycle, webhooks, and authority boundaries.
 *   **Pay Gateway Developer Portal Contracts**: `ORBI PAY GATEWAY/docs/DEVELOPER_PORTAL_CONTRACTS.md` defines service onboarding, sandbox/live access, scopes, allowlists, API key rotation, webhook secret rotation, and developer events.
@@ -23,7 +29,10 @@ This is the **Sovereign Financial Operating System** powering the ORBI ecosystem
 *   **[Provider Registry Contract](./PROVIDER_REGISTRY_CONTRACT.md)**: Admin/UI and backend contract for registry-driven providers.
 *   **[Project Structure](./PROJECT_STRUCTURE.md)**: Repository layout and ownership.
 
-## 🚀 Core Features
+## Core Capability Baseline
+
+The entries below identify implemented capabilities. Their presence does not by
+itself mean the related product is certified for unrestricted production use.
 - **Orbi TrustBridge (Secure Escrow)**: Conditional payment system with PaySafe locking, multi-party release, and AI-assisted dispute resolution.
 - **Enterprise Treasury Automation**: Multi-Sig withdrawal flows, automated treasury auto-sweep, and departmental budget enforcement.
 - **Neural Sentinel AI (Security)**: Real-time behavioral risk analysis and fraud prevention for every ingress operation (<50ms latency).

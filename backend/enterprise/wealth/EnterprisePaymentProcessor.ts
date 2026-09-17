@@ -14,6 +14,7 @@ import { VaultRegistry } from '../ledger/VaultRegistry.js';
 import { BankingEngine } from '../../ledger/transactionEngine.js';
 import { SecurityService } from '../../../iam/securityService.js';
 import { FXEngine } from '../../ledger/FXEngine.js';
+import { resolveLockedFxConversion, type LockedFxQuote } from '../../ledger/FXLockedQuote.js';
 import { Messaging } from '../../features/MessagingService.js';
 
 export interface EntPaymentIntent {
@@ -42,7 +43,7 @@ export interface EntPaymentIntent {
 export class EnterprisePaymentProcessor {
     private rules = SecurityRules;
 
-    public async process(user: User, intent: EntPaymentIntent): Promise<any> {
+    public async process(user: User, intent: EntPaymentIntent, serverFxQuote?: LockedFxQuote): Promise<any> {
         console.log(`[EntProcessor] Starting process for user: ${user.id || 'N/A'}, customer_id: ${(user as any).customer_id || 'N/A'}`);
 
         if ((intent as any).dryRun) {
@@ -276,9 +277,17 @@ export class EnterprisePaymentProcessor {
 
             // Perform Conversion if currencies differ
             let conversionData = null;
+            if (String(intent.type).toUpperCase() === 'FX_CONVERSION' && !serverFxQuote) {
+                throw new Error('FX_LOCKED_QUOTE_REQUIRED');
+            }
+            if (String(intent.type).toUpperCase() === 'FX_CONVERSION' && sourceCurrency.toUpperCase() === targetCurrency.toUpperCase()) {
+                throw new Error('FX_QUOTE_WALLET_CURRENCY_MISMATCH');
+            }
             if (sourceCurrency && targetCurrency && sourceCurrency.toUpperCase() !== targetCurrency.toUpperCase()) {
                 console.log(`[EntProcessor] Cross-currency detected: ${sourceCurrency} -> ${targetCurrency}`);
-                conversionData = await FXEngine.processConversion(intent.amount, sourceCurrency, targetCurrency);
+                conversionData = serverFxQuote
+                    ? resolveLockedFxConversion(serverFxQuote, intent.amount, sourceCurrency, targetCurrency)
+                    : await FXEngine.processConversion(intent.amount, sourceCurrency, targetCurrency);
                 
                 // Update intent metadata with conversion details for BankingEngine and Audit
                 intent.metadata = {

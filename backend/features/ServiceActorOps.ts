@@ -1,7 +1,7 @@
 import { getAdminSupabase, getSupabase } from '../supabaseClient.js';
 import { ConfigClient } from '../infrastructure/RulesConfigClient.js';
 import { DataVault } from '../security/encryption.js';
-import { RegulatoryService } from '../../ledger/regulatoryService.js';
+import { systemSettlementAccounts } from '../ledger/SystemSettlementAccountService.js';
 import { platformFeeService } from '../payments/PlatformFeeService.js';
 import { UUID } from '../../services/utils.js';
 import { PerfMonitor } from '../infrastructure/PerfMonitor.js';
@@ -1287,7 +1287,11 @@ class ServiceActorOperations {
             return;
         }
 
-        const feeCollectorId = await RegulatoryService.resolveSystemNode('FEE_COLLECTOR');
+        const commissionCurrency = String(commission.currency || actorWallet.currency || '').trim().toUpperCase();
+        if (String(actorWallet.currency || '').trim().toUpperCase() !== commissionCurrency) {
+            throw new Error(`COMMISSION_WALLET_CURRENCY_MISMATCH:${commissionCurrency}`);
+        }
+        const feeCollectorId = await systemSettlementAccounts.resolve('COMMISSION_RESERVE', commissionCurrency);
         const txReference = `COMM-${UUID.generateShortCode(12)}`;
         const { TransactionService } = await import('../../ledger/transactionService.js');
         const txService = new TransactionService();

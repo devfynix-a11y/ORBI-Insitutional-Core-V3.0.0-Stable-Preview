@@ -47,7 +47,7 @@ export class RegulatoryServiceNode {
         type: string,
         currency: string,
         context?: { metadata?: Record<string, any>; category?: string },
-    ): Promise<{ vat: number, fee: number, gov_fee: number, total: number, rate: number }> {
+    ): Promise<{ vat: number, fee: number, gov_fee: number, stamp_duty: number, total: number, rate: number }> {
         const normalizedType = String(type || '').trim().toUpperCase();
         const normalizedCurrency = String(currency || '').trim().toUpperCase();
         if (!normalizedCurrency) {
@@ -81,8 +81,9 @@ export class RegulatoryServiceNode {
 
         return {
             vat: feeResult.taxAmount,
-            fee: feeResult.serviceFee + feeResult.stampDutyFixed,
+            fee: feeResult.serviceFee,
             gov_fee: feeResult.govFeeAmount,
+            stamp_duty: feeResult.stampDutyFixed,
             total: feeResult.totalFee,
             rate: feeResult.taxRate
         };

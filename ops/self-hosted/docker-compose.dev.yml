@@ -9,6 +9,7 @@ services:
       - ../../.env
     environment:
       NODE_ENV: ${NODE_ENV:-development}
+      ORBI_RUNTIME_ENVIRONMENT: ${ORBI_RUNTIME_ENVIRONMENT:-live}
       ORBI_AUTH_PROVIDER: keycloak
       ORBI_DATA_PROVIDER: local
       ORBI_INTERNAL_MTLS_MODE: ${ORBI_INTERNAL_MTLS_MODE:-optional}

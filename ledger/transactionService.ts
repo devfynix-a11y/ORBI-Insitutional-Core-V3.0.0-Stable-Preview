@@ -16,6 +16,7 @@ import { RiskComplianceEngine } from '../backend/security/RiskComplianceEngine.j
 import { PerfMonitor } from '../backend/infrastructure/PerfMonitor.js';
 import { logger } from '../backend/infrastructure/logger.js';
 import { TransactionMovementClassifier } from '../backend/transactions/movement/TransactionMovementClassifier.js';
+import { getOrbiDatabase } from '../services/orbiDatabase.js';
 
 const ledgerLogger = logger.child({ component: 'transaction_service' });
 
@@ -27,6 +28,59 @@ const ledgerLogger = logger.child({ component: 'transaction_service' });
 export class TransactionService {
     public normalizeFinancialAuthorityError(error: any, context: string = 'FINANCIAL_AUTHORITY'): Error {
         return normalizeFinancialAuthorityError(error, context);
+    }
+
+    public async getMobileTransactions(
+        userId: string,
+        limit: number = 50,
+        offset: number = 0,
+    ): Promise<any[]> {
+        const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+        const safeOffset = Math.max(Number(offset) || 0, 0);
+        const result = await getOrbiDatabase().query(
+            `
+              WITH owned_transaction_ids AS (
+                SELECT DISTINCT transaction_id
+                FROM public.financial_ledger
+                WHERE user_id = $1::uuid
+                  AND transaction_id IS NOT NULL
+              )
+              SELECT
+                t.id, t.reference_id, t.user_id, t.amount, t.currency,
+                t.description, t.type, t.status, t.created_at,
+                t.wallet_id, t.to_wallet_id, t.metadata, t.category_id
+              FROM public.transactions t
+              WHERE t.user_id = $1::uuid
+                 OR EXISTS (
+                   SELECT 1 FROM owned_transaction_ids owned
+                   WHERE owned.transaction_id = t.id
+                 )
+              ORDER BY t.created_at DESC
+              LIMIT $2 OFFSET $3
+            `,
+            [userId, safeLimit, safeOffset],
+        );
+
+        const rows = await this.decryptTransactionRows(result.rows || []);
+        return rows.map((row: any) => {
+            const isSender = String(row.user_id || '') === String(userId);
+            const rawStatus = String(row.status || '').toLowerCase();
+            const status = rawStatus === 'processing'
+                ? 'processing'
+                : ['failed', 'reversed', 'refunded', 'cancelled'].includes(rawStatus)
+                  ? 'failed'
+                  : ['created', 'pending', 'authorized'].includes(rawStatus)
+                    ? 'initiated'
+                    : 'completed';
+            return {
+                ...row,
+                id: row.reference_id || row.id,
+                internalId: row.id,
+                referenceId: row.reference_id || row.id,
+                direction: isSender ? 'DEBIT' : 'CREDIT',
+                status,
+            };
+        });
     }
 
     private async decryptTransactionRows(rows: any[]): Promise<any[]> {
@@ -599,6 +653,7 @@ export class TransactionService {
                 wallet_id: walletId,
                 user_id: leg.userId || ownerByWalletId.get(String(walletId)) || t.user_id || null,
                 entry_type: leg.type,
+                currency: leg.currency,
                 amount: eAmt,
                 amount_plain: leg.amount,
                 description: leg.description
@@ -716,6 +771,7 @@ export class TransactionService {
                 wallet_id: walletId,
                 user_id: leg.userId || ownerByWalletId.get(String(walletId)) || null,
                 entry_type: leg.type,
+                currency: leg.currency,
                 amount: eAmt,
                 amount_plain: leg.amount,
                 description: leg.description,
@@ -866,10 +922,29 @@ export class TransactionService {
 
         return await PerfMonitor.track(`Ledger.getLatestTransactions:${userId}:${limit}:${offset}`, async () => {
             try {
-            // 1. Get User's Wallet IDs (to find incoming transactions)
-            const [{ data: wallets }, { data: vaults }] = await Promise.all([
+            // Resolve identity-owned containers, ledger references and direct
+            // transactions in parallel. financial_ledger.user_id is assigned
+            // by the wallet-owner trigger, so it is the authoritative indexed
+            // path for incoming as well as outgoing transaction references.
+            const transactionSelectFields = 'id, reference_id, user_id, amount, currency, description, type, status, created_at, wallet_id, to_wallet_id, metadata, category_id';
+            const [
+                { data: wallets },
+                { data: vaults },
+                { data: ownedLedgerRefs, error: ownedLedgerRefError },
+                { data: directTransactions, error: directTransactionError },
+            ] = await Promise.all([
                 sb.from('wallets').select('id').eq('user_id', userId),
                 sb.from('platform_vaults').select('id').eq('user_id', userId),
+                sb.from('financial_ledger')
+                    .select('transaction_id')
+                    .eq('user_id', userId)
+                    .order('created_at', { ascending: false })
+                    .range(offset, offset + Math.max(limit * 4, limit) - 1),
+                sb.from('transactions')
+                    .select(transactionSelectFields)
+                    .eq('user_id', userId)
+                    .order('created_at', { ascending: false })
+                    .range(offset, offset + limit - 1),
             ]);
             
             const walletIds = [
@@ -880,14 +955,6 @@ export class TransactionService {
 
             ledgerLogger.info('ledger.transactions_fetch_started', { actor_id: userId, wallet_count: walletIds.length });
 
-            const { data: ownedLedgerRefs, error: ownedLedgerRefError } = walletIds.length
-                ? await sb
-                    .from('financial_ledger')
-                    .select('transaction_id')
-                    .in('wallet_id', walletIds)
-                    .order('created_at', { ascending: false })
-                    .range(offset, offset + Math.max(limit * 4, limit) - 1)
-                : { data: [] as any[], error: null };
             if (ownedLedgerRefError) {
                 ledgerLogger.warn('ledger.owned_ledger_transaction_lookup_failed', {
                     actor_id: userId,
@@ -900,29 +967,13 @@ export class TransactionService {
                     .filter(Boolean)
             ));
 
-            // 2. Query Transactions (Outgoing OR Incoming)
-            const transactionSelectFields = 'id, reference_id, user_id, amount, currency, description, type, status, created_at, wallet_id, to_wallet_id, metadata, category_id';
-            let query = sb
-                .from('transactions')
-                .select(transactionSelectFields)
-                .order('created_at', { ascending: false })
-                .range(offset, offset + limit - 1);
-
-            const orClauses = [`user_id.eq.${userId}`];
-            if (walletIds.length > 0) {
-                orClauses.push(`to_wallet_id.in.(${walletIds.join(',')})`);
-            }
-            query = query.or(orClauses.join(','));
-
-            const { data, error } = await query;
-
-            if (error) {
-                ledgerLogger.error('ledger.transactions_query_failed', { actor_id: userId, error_message: error.message }, error);
-                throw error;
+            if (directTransactionError) {
+                ledgerLogger.error('ledger.transactions_query_failed', { actor_id: userId, error_message: directTransactionError.message }, directTransactionError);
+                throw directTransactionError;
             }
             
             const transactionRowsById = new Map<string, any>();
-            (data || []).forEach((row: any) => {
+            (directTransactions || []).forEach((row: any) => {
                 if (row?.id) transactionRowsById.set(String(row.id), row);
             });
 

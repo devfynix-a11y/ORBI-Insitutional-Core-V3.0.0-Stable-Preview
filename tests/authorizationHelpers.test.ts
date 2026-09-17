@@ -199,6 +199,7 @@ test('createInternalWorkerMiddleware accepts signed requests and exposes audit m
   process.env.WORKER_SECRET = 'top-secret';
   process.env.WORKER_SIGNING_SECRET = 'signing-secret';
   process.env.ORBI_REQUIRE_SIGNED_INTERNAL_REQUESTS = 'true';
+  process.env.ORBI_RUNTIME_ENVIRONMENT = 'live';
   process.env.ORBI_ALLOW_PROCESS_LOCAL_INTERNAL_REPLAY_STORE = 'true';
 
   const previousRedisGetClient = RedisClusterFactory.getClient;
@@ -217,6 +218,7 @@ test('createInternalWorkerMiddleware accepts signed requests and exposes audit m
     timestamp,
     nonce,
     requestId,
+    'live',
     bodySha256,
   ].join('\n');
   const signature = crypto.createHmac('sha256', 'signing-secret').update(canonical).digest('hex');
@@ -237,6 +239,7 @@ test('createInternalWorkerMiddleware accepts signed requests and exposes audit m
         'x-worker-timestamp': timestamp,
         'x-worker-nonce': nonce,
         'x-worker-request-id': requestId,
+        'x-orbi-environment': 'live',
         'x-worker-signature': signature,
         'user-agent': 'worker-test',
       };
@@ -263,6 +266,7 @@ test('createInternalWorkerMiddleware blocks replayed signed requests', async () 
   process.env.WORKER_SECRET = 'top-secret';
   process.env.WORKER_SIGNING_SECRET = 'signing-secret';
   process.env.ORBI_REQUIRE_SIGNED_INTERNAL_REQUESTS = 'true';
+  process.env.ORBI_RUNTIME_ENVIRONMENT = 'live';
   process.env.ORBI_ALLOW_PROCESS_LOCAL_INTERNAL_REPLAY_STORE = 'true';
 
   const previousRedisGetClient = RedisClusterFactory.getClient;
@@ -281,6 +285,7 @@ test('createInternalWorkerMiddleware blocks replayed signed requests', async () 
     timestamp,
     nonce,
     requestId,
+    'live',
     bodySha256,
   ].join('\n');
   const signature = crypto.createHmac('sha256', 'signing-secret').update(canonical).digest('hex');
@@ -301,6 +306,7 @@ test('createInternalWorkerMiddleware blocks replayed signed requests', async () 
         'x-worker-timestamp': timestamp,
         'x-worker-nonce': nonce,
         'x-worker-request-id': requestId,
+        'x-orbi-environment': 'live',
         'x-worker-signature': signature,
         'user-agent': 'worker-test',
       };
@@ -327,6 +333,7 @@ test('createInternalWorkerMiddleware enforces mTLS when configured as required',
   process.env.WORKER_SECRET = 'top-secret';
   process.env.WORKER_SIGNING_SECRET = 'signing-secret';
   process.env.ORBI_REQUIRE_SIGNED_INTERNAL_REQUESTS = 'true';
+  process.env.ORBI_RUNTIME_ENVIRONMENT = 'live';
   process.env.ORBI_INTERNAL_MTLS_MODE = 'required';
 
   const body = { amount: 10 };
@@ -342,6 +349,7 @@ test('createInternalWorkerMiddleware enforces mTLS when configured as required',
     timestamp,
     nonce,
     requestId,
+    'live',
     bodySha256,
   ].join('\n');
   const signature = crypto.createHmac('sha256', 'signing-secret').update(canonical).digest('hex');
@@ -361,6 +369,7 @@ test('createInternalWorkerMiddleware enforces mTLS when configured as required',
         'x-worker-timestamp': timestamp,
         'x-worker-nonce': nonce,
         'x-worker-request-id': requestId,
+        'x-orbi-environment': 'live',
         'x-worker-signature': signature,
       };
       return lookup[name.toLowerCase()] || undefined;
@@ -387,6 +396,7 @@ test('production default mTLS mode resolves to required when unset', async () =>
   process.env.NODE_ENV = 'production';
   delete process.env.ORBI_INTERNAL_MTLS_MODE;
   process.env.ORBI_REQUIRE_SIGNED_INTERNAL_REQUESTS = 'true';
+  process.env.ORBI_RUNTIME_ENVIRONMENT = 'live';
   process.env.WORKER_SIGNING_SECRET = 'signing-secret';
 
   const body = { amount: 15 };
@@ -421,6 +431,7 @@ test('production default mTLS mode resolves to required when unset', async () =>
         'x-worker-timestamp': timestamp,
         'x-worker-nonce': nonce,
         'x-worker-request-id': requestId,
+        'x-orbi-environment': 'live',
         'x-worker-signature': signature,
       };
       return lookup[name.toLowerCase()] || undefined;

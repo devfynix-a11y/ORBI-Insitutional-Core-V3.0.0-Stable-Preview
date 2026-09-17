@@ -62,7 +62,7 @@ All endpoints are protected and require a valid user session.
 ---
 
 ## 4. Programmatic Access (External API)
-Tenants can use their `secret_key` to access the ORBI platform programmatically without a user session. This is ideal for server-to-server integrations.
+Tenants use a secret API key for server-to-server access. Raw secrets are shown once and never persisted. Requests must include `x-api-environment` and `x-api-audience`; every endpoint enforces its required scopes. Customer-subject requests also require `x-orbi-subject` and `x-orbi-purpose`, backed by active, unexpired consent.
 
 ### 4.1 Authentication Header
 All programmatic requests must include the `x-api-key` header:
@@ -269,7 +269,7 @@ The **FX Engine** enables seamless cross-border payments by automatically conver
 3.  **Rate Fetching**: The `FXEngine` requests a market rate from the formal `LiquidityProviderAdapter`. Manual/admin-entered market rates are not used in the transaction path.
 4.  **Spread Policy**: ORBI applies spread, pips, risk buffer, and quote-lock rules from `fx_margin_policies`. There is no separate FX fee.
 5.  **Fail-Closed Protection**: If the corridor or liquidity provider cannot supply a valid rate, the quote fails instead of silently using stale or manual fallback rates.
-6.  **Metadata Enrichment**: Conversion details (corridor, provider snapshot, protected customer rate, target amount, quote expiry) are stored in the transaction metadata for ledger processing.
+6.  **Locked Snapshot**: The server stores and signs the amount, currency pair, customer rate, market rate, spread, final amount, and expiry. Settlement verifies that snapshot and uses it directly; it never re-prices a locked quote.
 
 ### 12.1.1 International FX Corridors
 International FX is controlled by `fx_corridors`:
@@ -284,15 +284,28 @@ Users can hold multiple ORBI operating wallets under the same identity, one per 
 - **Opening Rule**: A currency wallet can be opened only when that currency appears in at least one `ACTIVE` FX corridor.
 - **Wallet Source**: Currency wallets are stored in `platform_vaults` with `vault_role = 'OPERATING'`, encrypted zero balance, and `metadata.wallet_family = 'orbi_multi_currency'`.
 - **No Linked-Wallet Fallback**: FX target wallets must be real ORBI vaults. If a target currency wallet does not exist, the client must call `POST /v1/wallets/currency` before locking a conversion quote.
-- **Ledger Rule**: Conversions between currency wallets always use a locked FX quote and double-entry ledger movement through `FX_CLEARING`.
+- **Ledger Rule**: Conversions between currency wallets always use a signed, unexpired locked quote and double-entry ledger movement through currency-specific `FX_CLEARING` accounts.
 
-### 12.2 Multi-Currency Ledger (FX Clearing)
-To maintain ledger integrity across different currencies, the system utilizes an **`FX_CLEARING`** system node:
+### 12.2 Multi-Currency Ledger, Company Revenue, and FX Clearing
+To maintain ledger integrity across different currencies, the system uses a separate **`FX_CLEARING`** company account for each currency:
 - **Debit Source**: Funds are debited from the sender's wallet in the source currency.
-- **Credit FX Clearing**: The source amount is credited to the `FX_CLEARING` node.
-- **Debit FX Clearing**: The converted amount (in the target currency) is debited from the `FX_CLEARING` node.
+- **Credit Source Clearing**: The source amount is credited to the source-currency `FX_CLEARING` account.
+- **Debit Target Clearing**: The target-currency `FX_CLEARING` account is debited for the converted customer amount, FX spread, and any explicitly configured FX fee.
 - **Credit Target**: The final amount is credited to the recipient's wallet in their local currency.
-- **Spread Accounting**: FX spread is captured through the protected conversion rate. No separate FX fee leg is produced.
+- **Spread Accounting**: The quoted spread is credited to `FX_SPREAD_REVENUE`; the configured risk-buffer portion is credited to `FX_RISK_RESERVE`. They are separate accounts and are never treated as customer balances.
+
+All company-owned funds are segregated by role and currency in `system_settlement_accounts`:
+
+| Account role | Purpose |
+| :--- | :--- |
+| `SERVICE_REVENUE` | ORBI service charges after settlement. |
+| `TAX_RESERVE` | VAT, government fees, and stamp duty retained pending remittance. |
+| `FX_CLEARING` | Treasury liquidity used to settle each currency leg of an FX conversion. |
+| `FX_SPREAD_REVENUE` | Realized ORBI FX margin, recorded in the target currency. |
+| `FX_RISK_RESERVE` | Quoted FX risk buffer, retained separately from revenue. |
+| `COMMISSION_RESERVE` | Funds reserved for merchant, agent, and referral commission payouts. |
+
+The ledger rejects a posting when a leg's currency differs from the wallet denomination, and it requires debits and credits to balance independently for every currency. This prevents apparent numerical balance that hides a cross-currency loss.
 
 ### 12.3 Global Policy Enforcement
 All transaction limits and risk assessments are normalized to **USD** using the `FXEngine` before being evaluated by the `PolicyEngine`. This ensures consistent enforcement of institutional rules regardless of the transaction currency.
@@ -316,4 +329,3 @@ By implementing this architecture, ORBI is now capable of:
 - **Complex Marketplaces**: Platforms can onboard their own merchants, and ORBI handles the split-routing and settlement.
 - **TrustBridge Escrow**: Marketplaces can use the conditional escrow system to protect buyers and sellers, holding funds in `PaySafe` until delivery is confirmed.
 - **B2B SaaS**: Companies can use ORBI to manage their internal departmental budgets (Cost Centers as Tenants).
-

@@ -45,10 +45,11 @@ The **ORBI Reconciliation Engine** is a mission-critical service designed to ens
     *   Trigger manual investigation workflow.
 
 ### 2.4 Multi-Currency Reconciliation (FX Clearing)
-*   **Target**: `FX_CLEARING` system node.
+*   **Target**: Currency-specific `FX_CLEARING` accounts and the linked `FX_SPREAD_REVENUE` and `FX_RISK_RESERVE` accounts.
 *   **Logic**:
-    1.  Verify that for every cross-currency transaction, the `FX_CLEARING` node has matching debit and credit entries across the source and target currencies.
-    2.  Ensure the net position of the `FX_CLEARING` account (when converted to a base currency like USD) remains within institutional risk limits.
+    1.  Verify the signed quote snapshot and compare its source amount, customer rate, final amount, spread, and risk buffer with the settlement legs.
+    2.  Verify that source and target `FX_CLEARING` accounts balance independently in their own currencies.
+    3.  Verify that the spread and risk-buffer credits reached their matching company accounts and that the net currency position remains within Treasury limits.
 *   **Anomalies Detected**:
     *   **Unbalanced Conversions**: Transactions where the conversion legs in the `FX_CLEARING` account do not match the expected exchange rate.
     *   **Currency Leakage**: Discrepancies in the `FX_CLEARING` account that indicate potential rounding errors or unauthorized manual adjustments.

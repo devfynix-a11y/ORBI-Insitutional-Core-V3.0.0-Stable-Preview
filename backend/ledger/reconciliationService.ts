@@ -11,6 +11,8 @@ import { ProviderFactory } from '../payments/providers/ProviderFactory.js';
 import { resolveProviderCode } from '../payments/financialPartnerMetadata.js';
 import { SocketRegistry } from '../infrastructure/SocketRegistry.js';
 import { DataProtection } from '../security/DataProtection.js';
+import { Treasury } from '../enterprise/treasuryService.js';
+import { Messaging } from '../features/MessagingService.js';
 // emailService and brevoSmsService removed as per user request.
 
 /**
@@ -21,6 +23,13 @@ import { DataProtection } from '../security/DataProtection.js';
  * Now handles 'Stuck Transaction' reaping for staged settlements.
  */
 export class ReconciliationService {
+    public async escalateOverdueExceptions(): Promise<number> {
+        const sb=getAdminSupabase();if(!sb)return 0;
+        const {data,error}=await sb.rpc('escalate_overdue_financial_exceptions_v1');if(error)throw new Error(error.message);
+        const {data:recipients}=await sb.from('staff').select('id').eq('account_status','ACTIVE').in('role',['SUPER_ADMIN','ADMIN','AUDIT','RISK_OFFICER']);
+        for(const item of data||[])for(const recipient of recipients||[]){try{await Messaging.dispatch(recipient.id,'security','Financial exception SLA breached',`Exception ${item.id} is overdue and requires immediate review.`,{push:true,sms:true,email:true,mandatory:true,systemCustomBypass:true,eventCode:'FINANCIAL_EXCEPTION_ESCALATED',idempotencyKey:`financial-exception:${item.id}:escalated:${recipient.id}`});}catch(e:any){console.warn(`[FinancialException] escalation notification deferred: ${e.message}`);}}
+        return (data||[]).length;
+    }
     private async resolvePartnerForVault(vault: any, partners: any[]): Promise<any | null> {
         const metadata = vault?.metadata && typeof vault.metadata === 'object' ? vault.metadata : {};
         const candidates = [
@@ -83,6 +92,11 @@ export class ReconciliationService {
 
             for (const tx of stuckTxs) {
                 try {
+                    if (tx.metadata?.is_treasury_withdrawal === true) {
+                        const recovered = await Treasury.recoverClaimedWithdrawal(tx.id, 'system-treasury-reaper');
+                        if (recovered) reapedCount++;
+                        continue;
+                    }
                     const createdAt = new Date(tx.created_at);
                     const ageMs = now.getTime() - createdAt.getTime();
                     const ageMinutes = ageMs / (1000 * 60);
@@ -295,6 +309,15 @@ export class ReconciliationService {
         await sb.from('reconciliation_reports').insert(fullReport);
         
         if (fullReport.status === 'MISMATCH') {
+            const severity = Number(fullReport.difference || 0) >= 1_000_000 ? 'CRITICAL' : Number(fullReport.difference || 0) > 0 ? 'HIGH' : 'MEDIUM';
+            const { error: exceptionError } = await sb.rpc('open_financial_exception_v1', {
+                p_source_type: 'RECONCILIATION', p_source_id: fullReport.id,
+                p_organization_id: (fullReport.metadata as any)?.organizationId || null,
+                p_severity: severity, p_category: String(fullReport.type || 'RECONCILIATION_MISMATCH'),
+                p_title: `Reconciliation mismatch: ${fullReport.type || 'UNKNOWN'}`,
+                p_details: fullReport,
+            });
+            if (exceptionError) throw new Error(`FINANCIAL_EXCEPTION_OPEN_FAILED: ${exceptionError.message}`);
             // Trigger high-priority alerts
             await Audit.log('SECURITY', 'recon-engine', 'RECON_MISMATCH_DETECTED', fullReport);
         }

@@ -34,7 +34,7 @@
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
-    "firebase-admin": "^13.7.0",
+    "firebase-admin": "^14.3.0",
     "graphql": "^17.0.2",
     "helmet": "^8.1.0",
     "ioredis": "^5.9.3",

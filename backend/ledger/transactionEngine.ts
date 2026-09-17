@@ -7,6 +7,7 @@ import { DataProtection } from '../security/DataProtection.js';
 import { logger } from '../infrastructure/logger.js';
 
 import { RegulatoryService } from './regulatoryService.js';
+import { systemSettlementAccounts } from './SystemSettlementAccountService.js';
 import { TransactionService } from '../../ledger/transactionService.js';
 import {
     assertSettlementEligible,
@@ -467,12 +468,13 @@ export class BankingEngineService {
 
                 // 2. Handle Cross-Currency Clearing if needed
                 if (isCrossCurrency && fxDetails) {
-                    const fxClearingId = await RegulatoryService.resolveSystemNode('FX_CLEARING');
+                    const sourceFxClearingId = await systemSettlementAccounts.resolve('FX_CLEARING', sourceCurrency);
+                    const targetFxClearingId = await systemSettlementAccounts.resolve('FX_CLEARING', targetCurrency);
                     
                     // Credit FX Clearing in Source Currency
                     legs.push({
                         transactionId: txId,
-                        walletId: fxClearingId,
+                        walletId: sourceFxClearingId,
                         type: 'CREDIT',
                         amount: amount,
                         currency: sourceCurrency,
@@ -483,9 +485,9 @@ export class BankingEngineService {
                     // Debit FX Clearing in Target Currency
                     legs.push({
                         transactionId: txId,
-                        walletId: fxClearingId,
+                        walletId: targetFxClearingId,
                         type: 'DEBIT',
-                        amount: fxDetails.finalAmount + (fxDetails.feeInTargetCurrency || fxDetails.fee || 0),
+                        amount: Number((Number(fxDetails.finalAmount) + Number(fxDetails.spreadAmount || 0) + Number(fxDetails.feeInTargetCurrency || fxDetails.fee || 0)).toFixed(4)),
                         currency: targetCurrency,
                         description: `FX Clearing (Target): ${sourceCurrency} -> ${targetCurrency}`,
                         timestamp: new Date().toISOString()
@@ -502,10 +504,12 @@ export class BankingEngineService {
                         timestamp: new Date().toISOString()
                     });
 
+                    await this.addFxSpreadLegs(legs, txId, fxDetails, targetCurrency);
+
                     // 4. Credit Fee Collector (FX Fee in Target Currency)
                     const fxFeeTargetAmount = fxDetails.feeInTargetCurrency || fxDetails.fee || 0;
                     if (this.isPositiveAmount(fxFeeTargetAmount)) {
-                        const feeCollectorId = await RegulatoryService.resolveSystemNode('FEE_COLLECTOR');
+                        const feeCollectorId = await systemSettlementAccounts.resolve('SERVICE_REVENUE', targetCurrency);
                         legs.push({
                             transactionId: txId,
                             walletId: feeCollectorId,
@@ -529,19 +533,7 @@ export class BankingEngineService {
                     });
                 }
 
-                // 5. Credit Fee Collector (Regulatory Fees in Source Currency)
-                if (this.isPositiveAmount(fees.total)) {
-                    const feeCollectorId = await RegulatoryService.resolveSystemNode('FEE_COLLECTOR');
-                    legs.push({
-                        transactionId: txId,
-                        walletId: feeCollectorId,
-                        type: 'CREDIT',
-                        amount: fees.total,
-                        currency: sourceCurrency,
-                        description: `PaySafe Fee Collection: ${txId}`,
-                        timestamp: new Date().toISOString()
-                    });
-                }
+                await this.addRegulatoryFeeLegs(legs, txId, fees, sourceCurrency);
 
                 return { legs, balanceHint };
             } else {
@@ -564,12 +556,13 @@ export class BankingEngineService {
 
         if (targetWalletId) {
             if (isCrossCurrency && fxDetails) {
-                const fxClearingId = await RegulatoryService.resolveSystemNode('FX_CLEARING');
+                const sourceFxClearingId = await systemSettlementAccounts.resolve('FX_CLEARING', sourceCurrency);
+                const targetFxClearingId = await systemSettlementAccounts.resolve('FX_CLEARING', targetCurrency);
                 
                 // Credit FX Clearing in Source Currency
                 legs.push({
                     transactionId: txId,
-                    walletId: fxClearingId,
+                    walletId: sourceFxClearingId,
                     type: 'CREDIT',
                     amount: amount,
                     currency: sourceCurrency,
@@ -580,9 +573,9 @@ export class BankingEngineService {
                 // Debit FX Clearing in Target Currency
                 legs.push({
                     transactionId: txId,
-                    walletId: fxClearingId,
+                    walletId: targetFxClearingId,
                     type: 'DEBIT',
-                    amount: fxDetails.finalAmount + (fxDetails.feeInTargetCurrency || fxDetails.fee || 0),
+                    amount: Number((Number(fxDetails.finalAmount) + Number(fxDetails.spreadAmount || 0) + Number(fxDetails.feeInTargetCurrency || fxDetails.fee || 0)).toFixed(4)),
                     currency: targetCurrency,
                     description: `FX Clearing (Target): ${sourceCurrency} -> ${targetCurrency}`,
                     timestamp: new Date().toISOString()
@@ -599,10 +592,12 @@ export class BankingEngineService {
                     timestamp: new Date().toISOString()
                 });
 
+                await this.addFxSpreadLegs(legs, txId, fxDetails, targetCurrency);
+
                 // Credit Fee Collector (FX Fee in Target Currency)
                 const fxFeeTargetAmount = fxDetails.feeInTargetCurrency || fxDetails.fee || 0;
                 if (this.isPositiveAmount(fxFeeTargetAmount)) {
-                    const feeCollectorId = await RegulatoryService.resolveSystemNode('FEE_COLLECTOR');
+                        const feeCollectorId = await systemSettlementAccounts.resolve('SERVICE_REVENUE', targetCurrency);
                     legs.push({
                         transactionId: txId,
                         walletId: feeCollectorId,
@@ -626,21 +621,46 @@ export class BankingEngineService {
             }
         }
 
-        // Credit Fees for external transactions too (Regulatory Fees in Source Currency)
-        if (this.isPositiveAmount(fees.total)) {
-            const feeCollectorId = await RegulatoryService.resolveSystemNode('FEE_COLLECTOR');
-            legs.push({
-                transactionId: txId,
-                walletId: feeCollectorId,
-                type: 'CREDIT',
-                amount: fees.total,
-                currency: sourceCurrency,
-                description: `Fee Collection: ${txId}`,
-                timestamp: new Date().toISOString()
-            });
-        }
+        await this.addRegulatoryFeeLegs(legs, txId, fees, sourceCurrency);
 
         return { legs, balanceHint };
+    }
+
+    private async addRegulatoryFeeLegs(legs: LedgerEntry[], txId: string, fees: any, currency: string) {
+        const serviceAmount = Number(fees.fee || 0);
+        const taxComponents = Number(fees.vat || 0) + Number(fees.gov_fee || 0) + Number(fees.stamp_duty || 0);
+        const taxAmount = Number((Number(fees.total || 0) - serviceAmount).toFixed(4));
+        if (taxAmount < 0 || Math.abs(taxAmount - taxComponents) > 0.00021) {
+            throw new Error('FEE_COMPONENTS_NOT_BALANCED');
+        }
+        if (this.isPositiveAmount(serviceAmount)) {
+            const walletId = await systemSettlementAccounts.resolve('SERVICE_REVENUE', currency);
+            legs.push({ transactionId: txId, walletId, type: 'CREDIT', amount: serviceAmount,
+                currency, description: `ORBI service revenue: ${txId}`, timestamp: new Date().toISOString() });
+        }
+        if (this.isPositiveAmount(taxAmount)) {
+            const walletId = await systemSettlementAccounts.resolve('TAX_RESERVE', currency);
+            legs.push({ transactionId: txId, walletId, type: 'CREDIT', amount: taxAmount,
+                currency, description: `Statutory tax reserve: ${txId}`, timestamp: new Date().toISOString() });
+        }
+    }
+
+    private async addFxSpreadLegs(legs: LedgerEntry[], txId: string, fxDetails: any, currency: string) {
+        const spread = Number(fxDetails.spreadAmount || 0);
+        if (!Number.isFinite(spread) || spread < 0) throw new Error('FX_SPREAD_INVALID');
+        if (!this.isPositiveAmount(spread)) return;
+        const riskAmount = Math.min(spread, Math.max(0, Number(fxDetails.quotedRiskBufferAmount || 0)));
+        const marginAmount = Number((spread - riskAmount).toFixed(4));
+        if (this.isPositiveAmount(marginAmount)) {
+            const walletId = await systemSettlementAccounts.resolve('FX_SPREAD_REVENUE', currency);
+            legs.push({ transactionId: txId, walletId, type: 'CREDIT', amount: marginAmount,
+                currency, description: `FX spread margin: ${txId}`, timestamp: new Date().toISOString() });
+        }
+        if (this.isPositiveAmount(riskAmount)) {
+            const walletId = await systemSettlementAccounts.resolve('FX_RISK_RESERVE', currency);
+            legs.push({ transactionId: txId, walletId, type: 'CREDIT', amount: riskAmount,
+                currency, description: `FX risk reserve: ${txId}`, timestamp: new Date().toISOString() });
+        }
     }
 
     private isPositiveAmount(value: unknown): boolean {

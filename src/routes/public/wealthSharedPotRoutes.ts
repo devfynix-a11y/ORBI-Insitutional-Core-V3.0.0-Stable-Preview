@@ -222,13 +222,17 @@ const notifyPotMembers = async (
   const userIds: string[] = Array.from(
     new Set<string>((members || []).map((member: any) => String(member.user_id || '')).filter(Boolean)),
   ).filter((userId) => !excluded.has(userId));
+  const eventCode = variables.eventCode || 'SHARED_POT_GOVERNANCE_UPDATED';
+  const eventId = String(variables.eventId || variables.transactionId || variables.requestId || variables.inviteId || variables.memberId || '').trim();
   await Promise.all(userIds.map((userId) => Messaging.dispatch(userId, 'info', subject, body, {
     push: true,
     sms: true,
     email: true,
+    mandatory: true,
     template: variables.template,
     localized: variables.localized,
-    eventCode: variables.eventCode || 'SHARED_POT_GOVERNANCE_UPDATED',
+    eventCode,
+    ...(eventId ? { idempotencyKey: `${eventCode}:${eventId}` } : {}),
     variables: {
       ...variables,
       template: undefined,
@@ -312,9 +316,11 @@ const notifySharedPotContribution = async (sb: any, pot: any, contributorUserId:
       push: true,
       sms: true,
       email: true,
+      mandatory: true,
       template: 'Shared_Pot_Contribution_Confirmed',
       localized: contributorCopy,
       eventCode: 'SHARED_POT_CONTRIBUTION_CONFIRMED',
+      ...(transactionId ? { idempotencyKey: `SHARED_POT_CONTRIBUTION_CONFIRMED:${transactionId}` } : {}),
       variables: {
         eventCode: 'SHARED_POT_CONTRIBUTION_CONFIRMED',
         potId: pot.id,
@@ -376,6 +382,7 @@ const notifySharedPotWithdrawal = async (
   const amountLabel = formatContributionAmount(amount, pot.currency);
   const potName = String(pot.name || 'Fungu');
   const transactionId = data?.transaction?.id || data?.transaction?.internalId || data?.request?.transaction_id || null;
+  const eventId = String(transactionId || data?.request?.id || '').trim();
   const potBalance = data?.shared_pot?.current_amount ?? pot.current_amount;
   const eventCode = options.requiresApproval
     ? 'SHARED_POT_WITHDRAWAL_REQUESTED'
@@ -394,7 +401,9 @@ const notifySharedPotWithdrawal = async (
       push: true,
       sms: true,
       email: true,
+      mandatory: true,
       eventCode,
+      ...(eventId ? { idempotencyKey: `${eventCode}:${eventId}` } : {}),
       variables: {
         eventCode,
         potId: pot.id,
@@ -402,6 +411,7 @@ const notifySharedPotWithdrawal = async (
         amount: amountLabel,
         currency: String(pot.currency || 'TZS').toUpperCase(),
         transactionId,
+        eventId,
         potBalance,
         approvedByUserId: options.approvedByUserId || null,
       },

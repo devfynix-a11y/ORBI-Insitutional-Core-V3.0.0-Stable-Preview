@@ -150,6 +150,7 @@ if (dbEnv) {
       '--env',
       dbEnv,
       '--allow-write-fixture',
+      '--confirm-disposable-database',
     ]);
   }
 }

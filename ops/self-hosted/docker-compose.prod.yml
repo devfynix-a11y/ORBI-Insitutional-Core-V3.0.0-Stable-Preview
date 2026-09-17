@@ -205,6 +205,8 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
+      ORBI_RUNTIME_ENVIRONMENT: live
+      ORBI_ENABLE_SANDBOX_ROUTES: "false"
       ORBI_TLS_ENABLED: ${ORBI_CORE_TLS_ENABLED:-false}
       ORBI_AUTH_PROVIDER: keycloak
       ORBI_INTERNAL_MTLS_SOURCE: ${ORBI_CORE_INTERNAL_MTLS_SOURCE:-proxy}
@@ -270,8 +272,150 @@ services:
       start_period: 45s
     networks:
       - private
+
+  storage-sandbox:
+    <<: *service-defaults
+    image: ${ORBI_STORAGE_IMAGE:?Set ORBI_STORAGE_IMAGE}
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${ORBI_CORE_SANDBOX_STORAGE_ACCESS_KEY:?Set ORBI_CORE_SANDBOX_STORAGE_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${ORBI_CORE_SANDBOX_STORAGE_SECRET_KEY:?Set ORBI_CORE_SANDBOX_STORAGE_SECRET_KEY}
+    volumes:
+      - orbi_sandbox_storage_data:/data
+    mem_limit: 1g
+    cpus: 0.5
+    networks:
+      - sandbox_private
+
+  postgres-sandbox:
+    <<: *service-defaults
+    image: ${ORBI_POSTGRES_IMAGE:?Set ORBI_POSTGRES_IMAGE}
+    environment:
+      POSTGRES_DB: ${ORBI_CORE_SANDBOX_POSTGRES_DB:-orbi_core_sandbox}
+      POSTGRES_USER: ${ORBI_CORE_SANDBOX_POSTGRES_USER:?Set ORBI_CORE_SANDBOX_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${ORBI_CORE_SANDBOX_POSTGRES_PASSWORD:?Set ORBI_CORE_SANDBOX_POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - orbi_sandbox_postgres_data:/var/lib/postgresql/data
+      - ../../database/main.sql:/docker-entrypoint-initdb.d/010_orbi_main.sql:ro
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - sandbox_private
+      # Loopback-only database integration access; no live service is attached.
+      - sandbox_test_bridge
+
+  valkey-sandbox:
+    <<: *service-defaults
+    image: ${ORBI_VALKEY_IMAGE:?Set ORBI_VALKEY_IMAGE}
+    command: ["valkey-server", "--requirepass", "${ORBI_CORE_SANDBOX_VALKEY_PASSWORD:?Set ORBI_CORE_SANDBOX_VALKEY_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - orbi_sandbox_valkey_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a \"$${ORBI_CORE_SANDBOX_VALKEY_PASSWORD}\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    environment:
+      ORBI_CORE_SANDBOX_VALKEY_PASSWORD: ${ORBI_CORE_SANDBOX_VALKEY_PASSWORD:?Set ORBI_CORE_SANDBOX_VALKEY_PASSWORD}
+    networks:
+      - sandbox_private
+
+  storage-sandbox-init:
+    image: ${ORBI_STORAGE_CLIENT_IMAGE:?Set ORBI_STORAGE_CLIENT_IMAGE}
+    restart: "no"
+    depends_on:
+      storage-sandbox:
+        condition: service_started
+    environment:
+      SANDBOX_STORAGE_USER: ${ORBI_CORE_SANDBOX_STORAGE_ACCESS_KEY:?Set ORBI_CORE_SANDBOX_STORAGE_ACCESS_KEY}
+      SANDBOX_STORAGE_PASSWORD: ${ORBI_CORE_SANDBOX_STORAGE_SECRET_KEY:?Set ORBI_CORE_SANDBOX_STORAGE_SECRET_KEY}
+      SANDBOX_ASSET_BUCKET: ${ORBI_CORE_SANDBOX_ASSET_BUCKET:-orbi-sandbox-assets}
+      SANDBOX_KYC_BUCKET: ${ORBI_CORE_SANDBOX_KYC_BUCKET:-orbi-sandbox-kyc}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set sandbox http://storage-sandbox:9000 "$${SANDBOX_STORAGE_USER}" "$${SANDBOX_STORAGE_PASSWORD}"; do sleep 2; done
+        mc mb --ignore-existing "sandbox/$${SANDBOX_ASSET_BUCKET}"
+        mc mb --ignore-existing "sandbox/$${SANDBOX_KYC_BUCKET}"
+        mc anonymous set none "sandbox/$${SANDBOX_ASSET_BUCKET}"
+        mc anonymous set none "sandbox/$${SANDBOX_KYC_BUCKET}"
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sandbox_private
       - edge
       - ops
+
+  core-sandbox:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: orbi-core:${ORBI_RELEASE_ID:-local}
+    env_file:
+      - ${ORBI_CORE_SANDBOX_ENV_FILE:?Set ORBI_CORE_SANDBOX_ENV_FILE}
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      ORBI_RUNTIME_ENVIRONMENT: sandbox
+      ORBI_ENABLE_SANDBOX_ROUTES: "true"
+      ORBI_ENFORCE_HTTPS: "true"
+      ORBI_TRUST_PROXY: "true"
+      ORBI_AUTH_PROVIDER: keycloak
+      ORBI_REQUIRE_SIGNED_INTERNAL_REQUESTS: "true"
+      ORBI_ALLOW_LEGACY_INTERNAL_WORKER_AUTH: "false"
+      ORBI_ALLOW_HMAC_ONLY_INTERNAL_REQUESTS: "true"
+      ORBI_INTERNAL_MTLS_MODE: ${ORBI_CORE_SANDBOX_INTERNAL_MTLS_MODE:-optional}
+      ORBI_INTERNAL_MTLS_SOURCE: proxy
+      ORBI_KEYCLOAK_INTERNAL_URL: http://keycloak-sandbox:8080
+      ORBI_KEYCLOAK_ISSUER: ${ORBI_KEYCLOAK_SANDBOX_PUBLIC_URL:-https://auth.orbifinancial.com/realms/orbi-sandbox}
+      ORBI_KEYCLOAK_REALM: orbi-sandbox
+      ORBI_KEYCLOAK_AUDIENCE: ${ORBI_KEYCLOAK_SANDBOX_AUDIENCE:-orbi-core-sandbox}
+      ORBI_KEYCLOAK_MOBILE_CLIENT_ID: ${ORBI_KEYCLOAK_SANDBOX_MOBILE_CLIENT_ID:-orbi-mobile-sandbox}
+      DATABASE_URL: postgresql://${ORBI_CORE_SANDBOX_POSTGRES_USER}:${ORBI_CORE_SANDBOX_POSTGRES_PASSWORD}@postgres-sandbox:5432/${ORBI_CORE_SANDBOX_POSTGRES_DB:-orbi_core_sandbox}
+      VALKEY_URL: redis://:${ORBI_CORE_SANDBOX_VALKEY_PASSWORD}@valkey-sandbox:6379/0
+      WORKER_SIGNING_SECRET: ${PAYMENT_GATEWAY_SANDBOX_WORKER_SIGNING_SECRET:?Set PAYMENT_GATEWAY_SANDBOX_WORKER_SIGNING_SECRET}
+      ORBI_PAY_GATEWAY_INTERNAL_BASE_URL: http://pay-gateway-sandbox:3101
+      S3_ENDPOINT: ${ORBI_CORE_SANDBOX_STORAGE_ENDPOINT:-http://storage-sandbox:9000}
+      S3_ACCESS_KEY_ID: ${ORBI_CORE_SANDBOX_STORAGE_ACCESS_KEY:?Set ORBI_CORE_SANDBOX_STORAGE_ACCESS_KEY}
+      S3_SECRET_ACCESS_KEY: ${ORBI_CORE_SANDBOX_STORAGE_SECRET_KEY:?Set ORBI_CORE_SANDBOX_STORAGE_SECRET_KEY}
+      S3_BUCKET: ${ORBI_CORE_SANDBOX_ASSET_BUCKET:-orbi-sandbox-assets}
+      KYC_BUCKET: ${ORBI_CORE_SANDBOX_KYC_BUCKET:-orbi-sandbox-kyc}
+    depends_on:
+      postgres-sandbox:
+        condition: service_healthy
+      valkey-sandbox:
+        condition: service_healthy
+      storage-sandbox-init:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - "/tmp:size=256m,mode=1777"
+    expose: ["3001"]
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - sandbox_private
 
   pay-gateway:
     <<: *service-defaults
@@ -293,7 +437,8 @@ services:
       PAYMENT_GATEWAY_PROVIDER_MANIFEST_PATH: /app/config/providers.json
       PAYMENT_GATEWAY_SERVICE_REGISTRY_PATH: /app/config/services.json
       PAYMENT_GATEWAY_OPERATOR_DISCOVERY_API_KEY: ${PAYMENT_GATEWAY_OPERATOR_DISCOVERY_API_KEY}
-      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER:-https://pay.orbifinancial.com}
+      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER:-https://auth.orbifinancial.com/realms/orbi}
+      PAYMENT_GATEWAY_OIDC_IDENTITY_BACKCHANNEL_URL: ${PAYMENT_GATEWAY_OIDC_IDENTITY_BACKCHANNEL_URL:-http://keycloak:8080/realms/orbi}
       PAYMENT_GATEWAY_OIDC_IDENTITY_AUDIENCE: ${PAYMENT_GATEWAY_OIDC_IDENTITY_AUDIENCE:-orbi-pay-identity}
       PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID: ${PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID:-orbi-pay-developers}
       PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE: ${PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE:-orbi-pay-api}
@@ -308,7 +453,7 @@ services:
       ORBI_CORE_TRUSTED_MERCHANT_SETTLEMENTS_PATH: ${ORBI_CORE_TRUSTED_MERCHANT_SETTLEMENTS_PATH:-/api/internal/pay-gateway/merchant-settlements}
       ORBI_CORE_CALLBACK_TIMEOUT_MS: ${ORBI_CORE_CALLBACK_TIMEOUT_MS:-30000}
       PAYMENT_GATEWAY_WORKER_ID: ${PAYMENT_GATEWAY_WORKER_ID:-orbi-payment-gateway}
-      PAYMENT_GATEWAY_WORKER_SCOPES: ${PAYMENT_GATEWAY_WORKER_SCOPES:-gateway:events:write,gateway:service-payments:write,gateway:service-payments:result,gateway:identity:read,gateway:paysafe-balances:read,gateway:business-registration:write,gateway:merchant-payments:read,gateway:merchant-settlements:read}
+      PAYMENT_GATEWAY_WORKER_SCOPES: ${PAYMENT_GATEWAY_WORKER_SCOPES:-gateway:events:write,gateway:service-payments:write,gateway:service-payments:result,gateway:identity:read,gateway:notifications:push,gateway:paysafe-balances:read,gateway:business-registration:write,gateway:merchant-payments:read,gateway:merchant-settlements:read}
       WORKER_SIGNING_SECRET: ${WORKER_SIGNING_SECRET}
       WORKER_KEY_ID: ${WORKER_KEY_ID:-payment-gateway-v1}
       PAYMENT_GATEWAY_INTERNAL_MTLS_ENABLED: ${PAYMENT_GATEWAY_INTERNAL_MTLS_ENABLED:-false}
@@ -367,12 +512,13 @@ services:
       PAYMENT_GATEWAY_PROVIDER_MANIFEST_PATH: /app/config/providers.json
       PAYMENT_GATEWAY_SERVICE_REGISTRY_PATH: /app/config/services.json
       PAYMENT_GATEWAY_OPERATOR_DISCOVERY_API_KEY: ${PAYMENT_GATEWAY_SANDBOX_OPERATOR_DISCOVERY_API_KEY:?Set PAYMENT_GATEWAY_SANDBOX_OPERATOR_DISCOVERY_API_KEY}
-      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_SANDBOX_OIDC_IDENTITY_ISSUER:-https://sandbox-pay.orbifinancial.com}
+      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_SANDBOX_OIDC_IDENTITY_ISSUER:-https://auth.orbifinancial.com/realms/orbi-sandbox}
+      PAYMENT_GATEWAY_OIDC_IDENTITY_BACKCHANNEL_URL: ${PAYMENT_GATEWAY_SANDBOX_OIDC_IDENTITY_BACKCHANNEL_URL:-http://keycloak-sandbox:8080/realms/orbi-sandbox}
       PAYMENT_GATEWAY_OIDC_IDENTITY_AUDIENCE: ${PAYMENT_GATEWAY_SANDBOX_OIDC_IDENTITY_AUDIENCE:-orbi-pay-sandbox-identity}
       PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID: ${PAYMENT_GATEWAY_SANDBOX_OIDC_AUTHORIZATION_CLIENT_ID:-orbi-pay-sandbox-developers}
       PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE: ${PAYMENT_GATEWAY_SANDBOX_FINANCIAL_TOKEN_AUDIENCE:-orbi-pay-sandbox-api}
       PAYMENT_GATEWAY_OBP_SANDBOX_TOOLS_ENABLED: ${PAYMENT_GATEWAY_SANDBOX_TOOLS_ENABLED:-true}
-      ORBI_CORE_INTERNAL_BASE_URL: ${ORBI_CORE_SANDBOX_INTERNAL_BASE_URL:?Set ORBI_CORE_SANDBOX_INTERNAL_BASE_URL}
+      ORBI_CORE_INTERNAL_BASE_URL: ${ORBI_CORE_SANDBOX_INTERNAL_BASE_URL:-http://core-sandbox:3001}
       PAYMENT_GATEWAY_ALLOW_PRIVATE_HTTP_CORE: ${PAYMENT_GATEWAY_SANDBOX_ALLOW_PRIVATE_HTTP_CORE:-true}
       ORBI_CORE_TRUSTED_GATEWAY_EVENT_PATH: ${ORBI_CORE_SANDBOX_TRUSTED_GATEWAY_EVENT_PATH:-/api/internal/gateway/provider-events}
       ORBI_CORE_TRUSTED_SERVICE_PAYMENT_REQUEST_PATH: ${ORBI_CORE_SANDBOX_TRUSTED_SERVICE_PAYMENT_REQUEST_PATH:-/api/internal/pay-gateway/service-payment-requests}
@@ -384,7 +530,7 @@ services:
       ORBI_CORE_TRUSTED_MERCHANT_SETTLEMENTS_PATH: ${ORBI_CORE_SANDBOX_TRUSTED_MERCHANT_SETTLEMENTS_PATH:-/api/internal/pay-gateway/merchant-settlements}
       ORBI_CORE_CALLBACK_TIMEOUT_MS: ${ORBI_CORE_SANDBOX_CALLBACK_TIMEOUT_MS:-30000}
       PAYMENT_GATEWAY_WORKER_ID: ${PAYMENT_GATEWAY_SANDBOX_WORKER_ID:?Set PAYMENT_GATEWAY_SANDBOX_WORKER_ID}
-      PAYMENT_GATEWAY_WORKER_SCOPES: ${PAYMENT_GATEWAY_SANDBOX_WORKER_SCOPES:-gateway:events:write,gateway:service-payments:write,gateway:service-payments:result,gateway:identity:read,gateway:paysafe-balances:read,gateway:business-registration:write,gateway:payment-profiles:write,gateway:merchant-payments:read,gateway:merchant-settlements:read}
+      PAYMENT_GATEWAY_WORKER_SCOPES: ${PAYMENT_GATEWAY_SANDBOX_WORKER_SCOPES:-gateway:events:write,gateway:service-payments:write,gateway:service-payments:result,gateway:identity:read,gateway:notifications:push,gateway:paysafe-balances:read,gateway:business-registration:write,gateway:payment-profiles:write,gateway:merchant-payments:read,gateway:merchant-settlements:read}
       WORKER_SIGNING_SECRET: ${PAYMENT_GATEWAY_SANDBOX_WORKER_SIGNING_SECRET:?Set PAYMENT_GATEWAY_SANDBOX_WORKER_SIGNING_SECRET}
       WORKER_KEY_ID: ${PAYMENT_GATEWAY_SANDBOX_WORKER_KEY_ID:?Set PAYMENT_GATEWAY_SANDBOX_WORKER_KEY_ID}
       PAYMENT_GATEWAY_INTERNAL_MTLS_ENABLED: ${PAYMENT_GATEWAY_SANDBOX_INTERNAL_MTLS_ENABLED:-false}
@@ -420,8 +566,7 @@ services:
     mem_limit: 2g
     cpus: 1.0
     networks:
-      - private
-      - edge
+      - sandbox_private
 
   gateway:
     <<: *service-defaults
@@ -445,6 +590,7 @@ services:
     networks:
       - edge
       - private
+      - sandbox_private
 
   prometheus:
     <<: *service-defaults
@@ -541,6 +687,9 @@ services:
 networks:
   private:
     internal: true
+  sandbox_private:
+    internal: true
+  sandbox_test_bridge:
   edge:
   ops:
     internal: true
@@ -550,6 +699,9 @@ volumes:
   orbi_postgres_wal_archive:
   orbi_valkey_data:
   orbi_storage_data:
+  orbi_sandbox_storage_data:
+  orbi_sandbox_postgres_data:
+  orbi_sandbox_valkey_data:
   orbi_public_uploads:
   orbi_prometheus_data:
   orbi_grafana_data:

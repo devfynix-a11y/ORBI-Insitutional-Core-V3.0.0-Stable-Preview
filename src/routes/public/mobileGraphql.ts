@@ -11,6 +11,7 @@ import {
   graphql,
   printSchema,
 } from 'graphql';
+import { logger } from '../../../backend/infrastructure/logger.js';
 
 type Deps = {
   authenticate: RequestHandler;
@@ -21,6 +22,7 @@ type Deps = {
 
 const MAX_TRANSACTION_LIMIT = 100;
 const MAX_ESCROW_LIMIT = 50;
+const mobileGraphqlLogger = logger.child({ component: 'mobile_graphql' });
 
 const clampLimit = (value: unknown, fallback: number, max: number) => {
   const parsed = Number(value);
@@ -69,6 +71,7 @@ const MobileSnapshotType = new GraphQLObjectType({
     transactions: { type: JsonScalar },
     wealthSummary: { type: JsonScalar },
     paySafeEscrows: { type: JsonScalar },
+    degraded: { type: JsonScalar },
   },
 });
 
@@ -177,7 +180,7 @@ const fetchPaySafeEscrows = async (sb: any, userId: string, limit: number, statu
   return data || [];
 };
 
-const createMobileGraphqlSchema = (deps: Deps) => new GraphQLSchema({
+export const createMobileGraphqlSchema = (deps: Deps) => new GraphQLSchema({
   query: new GraphQLObjectType({
     name: 'Query',
     fields: {
@@ -203,26 +206,53 @@ const createMobileGraphqlSchema = (deps: Deps) => new GraphQLSchema({
             paySafeEscrows: args.paySafeEscrows !== false,
           };
 
-          const [dashboard, txs, wealth, escrows] = await Promise.all([
-            include.dashboard ? deps.LogicCore.getBootstrapData(token) : Promise.resolve(null),
-            include.transactions
-              ? deps.LogicCore.getTransactionsPaginated(
-                userId,
-                clampLimit(args.transactionLimit, 20, MAX_TRANSACTION_LIMIT),
-                0,
-              )
+          // Dashboard bootstrap already contains recent transactions. Reuse the
+          // same request when both fields are selected so a mobile snapshot does
+          // not issue two identical ledger queries under startup load.
+          const transactionsPromise = include.transactions
+            ? deps.LogicCore.getTransactionsPaginated(
+              userId,
+              clampLimit(args.transactionLimit, 20, MAX_TRANSACTION_LIMIT),
+              0,
+            )
+            : undefined;
+
+          const bootstrapTransactions = include.transactions
+            ? transactionsPromise
+            : [];
+
+          const results = await Promise.allSettled([
+            include.dashboard
+              ? deps.LogicCore.getBootstrapData(token, bootstrapTransactions)
               : Promise.resolve(null),
+            transactionsPromise ?? Promise.resolve(null),
             include.wealthSummary ? buildWealthSummary(sb, userId) : Promise.resolve(null),
             include.paySafeEscrows
               ? fetchPaySafeEscrows(sb, userId, clampLimit(args.escrowLimit, 20, MAX_ESCROW_LIMIT))
               : Promise.resolve(null),
           ]);
 
+          const labels = ['dashboard', 'transactions', 'wealthSummary', 'paySafeEscrows'] as const;
+          const fallbacks: unknown[] = [{}, [], {}, []];
+          const degraded: string[] = [];
+          const values = results.map((result, index) => {
+            if (result.status === 'fulfilled') return result.value;
+            const label = labels[index];
+            degraded.push(label);
+            mobileGraphqlLogger.warn('mobile_graphql.snapshot_resolver_degraded', {
+              resolver: label,
+              user_id: userId,
+              error: String(result.reason?.message || result.reason || 'UNKNOWN_ERROR'),
+            });
+            return fallbacks[index];
+          });
+
           return {
-            dashboard,
-            transactions: txs,
-            wealthSummary: wealth,
-            paySafeEscrows: escrows,
+            dashboard: values[0],
+            transactions: values[1],
+            wealthSummary: values[2],
+            paySafeEscrows: values[3],
+            degraded,
           };
         },
       },

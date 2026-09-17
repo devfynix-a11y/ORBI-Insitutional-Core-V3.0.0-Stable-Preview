@@ -6,6 +6,7 @@ import { TransactionService } from '../../ledger/transactionService.js';
 import { platformFeeService } from './PlatformFeeService.js';
 import { providerRoutingService } from './ProviderRoutingService.js';
 import { FXEngine } from '../ledger/FXEngine.js';
+import { verifyLockedFxSnapshot } from '../ledger/FXLockedQuote.js';
 import { transactionFeeClassifier } from './TransactionFeeClassifier.js';
 import { logger } from '../infrastructure/logger.js';
 import { createHash, createHmac } from 'crypto';
@@ -351,6 +352,14 @@ export class TransactionQuoteService {
     if (storedSignature && storedSignature !== expectedSignature) {
       throw new Error('QUOTE_SIGNATURE_INVALID: Transaction preview integrity check failed.');
     }
+    if (String(quoteRow.transaction_type || '').toUpperCase() === 'FX_CONVERSION') {
+      verifyLockedFxSnapshot(
+        quote,
+        quoteId,
+        args.userId,
+        process.env.ORBI_TRANSACTION_QUOTE_SIGNING_SECRET || process.env.JWT_SECRET || process.env.SESSION_SECRET || '',
+      );
+    }
 
     if (!canRetryConfirmedQuote) {
       const { data: confirmed, error: updateError } = await sb
@@ -454,15 +463,25 @@ export class TransactionQuoteService {
       .eq('user_id', args.userId);
     if (quoteUpdateError) throw quoteUpdateError;
 
+    const { data: reconciliationRow, error: reconciliationReadError } = await sb
+      .from('fx_reconciliation_events')
+      .select('metadata')
+      .eq('quote_id', quoteId)
+      .eq('user_id', args.userId)
+      .maybeSingle();
+    if (reconciliationReadError) throw reconciliationReadError;
+
     const { error: reconciliationUpdateError } = await sb
       .from('fx_reconciliation_events')
       .update({
         transaction_id: transactionId,
         status: success ? (settlementStatus === 'SETTLED' ? 'MATCHED' : 'PENDING') : (challenge ? 'PENDING' : 'FAILED'),
         metadata: {
+          ...(reconciliationRow?.metadata && typeof reconciliationRow.metadata === 'object' ? reconciliationRow.metadata : {}),
           settlementStatus: settlementStatus || null,
           challengeRequired: challenge,
           settlementResult: args.result || null,
+          revenueStatus: success ? 'SETTLED_SPREAD_ESTIMATE' : 'NOT_REALIZED',
         },
         updated_at: new Date().toISOString(),
       })

@@ -11,9 +11,11 @@ test('Keycloak realm requires PKCE and issues the ORBI Core audience', () => {
   const mobile = realm.clients.find((client: any) => client.clientId === 'orbi-mobile');
 
   assert.equal(realm.defaultSignatureAlgorithm, 'RS256');
+  assert.equal(realm.verifyEmail, true);
   assert.equal(realm.revokeRefreshToken, true);
   assert.equal(realm.refreshTokenMaxReuse, 0);
   assert.equal(mobile.publicClient, true);
+  assert.deepEqual(mobile.webOrigins, []);
   assert.equal(mobile.attributes['pkce.code.challenge.method'], 'S256');
   assert.ok(
     mobile.protocolMappers.some(
@@ -41,4 +43,7 @@ test('production topology keeps Keycloak private behind the edge', () => {
   assert.doesNotMatch(compose, /8081:8080/);
   assert.match(gateway, /server_name auth\.orbifinancial\.com/);
   assert.match(gateway, /server keycloak:8080/);
+  assert.match(gateway, /location \^~ \/admin\//);
+  assert.match(gateway, /location \^~ \/realms\/master\//);
+  assert.match(gateway, /server core:3000 resolve/);
 });

@@ -13,6 +13,7 @@ const REQUIRED_ENV_PROD = [
   'WORKER_SECRET',
   'WORKER_SIGNING_SECRET',
   'ORBI_INTERNAL_MTLS_MODE',
+  'ORBI_RUNTIME_ENVIRONMENT',
   'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY',
   'SUPABASE_ANON_KEY',
@@ -102,6 +103,14 @@ const warnGovernanceConfig = (event: string, payload: Record<string, unknown>) =
 
 export const validateStartupEnvironment = () => {
   const isProd = process.env.NODE_ENV === 'production';
+  const runtimeEnvironment = String(process.env.ORBI_RUNTIME_ENVIRONMENT || '').trim().toLowerCase();
+  if (isProd && !['sandbox','live'].includes(runtimeEnvironment)) fatalIfMissing('ORBI_RUNTIME_ENVIRONMENT');
+  if (isProd && runtimeEnvironment === 'live' && process.env.ORBI_ENABLE_SANDBOX_ROUTES === 'true') {
+    logger.fatal('startup.live_runtime_cannot_enable_sandbox_routes'); process.exit(1);
+  }
+  if (isProd && runtimeEnvironment === 'sandbox' && process.env.ORBI_ENABLE_SANDBOX_ROUTES !== 'true') {
+    logger.fatal('startup.sandbox_runtime_requires_sandbox_routes'); process.exit(1);
+  }
   const authProvider = String(process.env.ORBI_AUTH_PROVIDER || 'supabase').trim().toLowerCase();
   const usesLocalAuth = authProvider === 'local';
   const usesKeycloak = authProvider === 'keycloak';
@@ -110,12 +119,19 @@ export const validateStartupEnvironment = () => {
     String(process.env.ORBI_IMAGE_STORAGE_PROVIDER || '').trim().toLowerCase() === 'r2';
 
   for (const key of REQUIRED_ENV_PROD) {
+    if (runtimeEnvironment === 'sandbox' && key === 'FIREBASE_SERVICE_ACCOUNT_JSON_BASE64') {
+      continue;
+    }
     if (usesLocalData && ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY'].includes(key)) {
       continue;
     }
     if (isProd && !process.env[key]) {
       fatalIfMissing(key);
     }
+  }
+
+  if (isProd && runtimeEnvironment === 'sandbox' && !process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
+    logger.warn('startup.sandbox_push_provider_not_configured');
   }
 
   if (usesLocalAuth && !process.env.DATABASE_URL) {
@@ -422,7 +438,6 @@ const validateDbDependencies = async (isProd: boolean) => {
       process.exit(1);
     }
   }
-
   const isParameterizedRpcProbeMiss = (message: string) =>
     /without parameters in the schema cache/i.test(message) ||
     /function .* requires/i.test(message) ||

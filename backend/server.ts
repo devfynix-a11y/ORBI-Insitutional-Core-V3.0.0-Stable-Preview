@@ -59,6 +59,7 @@ import { listRegistryBackedBillProviders } from './payments/billProviderRegistry
 import { transactionQuoteService } from './payments/TransactionQuoteService.js';
 import { offlineGatewayService } from './offline/OfflineGatewayService.js';
 import { buildPostgrestOrFilter } from './security/postgrest.js';
+import { canAccessOrganizationResource } from './security/ecosystemAuthorization.js';
 import bcrypt from 'bcryptjs';
 import { getOrbiDatabase } from '../services/orbiDatabase.js';
 
@@ -124,6 +125,7 @@ class OrbiServer {
                     await ReconEngine.reapStuckTransactions();
                     await EntProcessor.settleProcessingTransactions();
                     await Treasury.sweepAllOrganizations();
+                    await ReconEngine.escalateOverdueExceptions();
                 } catch (e) {
                     console.error("[BackgroundJob] Cycle failed:", e);
                 } finally {
@@ -263,12 +265,31 @@ class OrbiServer {
     }
 
     // --- BOOTSTRAP ---
-    async getBootstrapData(token?: string): Promise<AppData> {
+    async getBootstrapData(
+        token?: string,
+        prefetchedTransactions?: Promise<any> | any
+    ): Promise<AppData> {
         const session = await this.getSession(token);
         if (!session) throw new Error("IDENTITY_REQUIRED");
+
+        // Recent ledger history is useful, but it must never hold the entire
+        // application bootstrap hostage. The dedicated transactions endpoint
+        // continues loading the full history after the shell is visible.
+        const transactionSource = prefetchedTransactions === undefined
+            ? this.ledger.getMobileTransactions(session.sub, 20, 0)
+            : Promise.resolve(prefetchedTransactions);
+        let transactionTimer: NodeJS.Timeout | undefined;
+        const boundedTransactions = Promise.race<any[]>([
+            transactionSource,
+            new Promise<any[]>((resolve) => {
+                transactionTimer = setTimeout(() => resolve([]), 1500);
+            }),
+        ]).finally(() => {
+            if (transactionTimer) clearTimeout(transactionTimer);
+        });
         
         const [transactions, wallets, goals, categories, tasks, messages] = await Promise.all([
-            this.ledger.getLatestTransactions(session.sub),
+            boundedTransactions,
             this.wallet.fetchForUser(session.sub),
             this.goal.fetchForUser(session.sub, token || session.access_token),
             this.category.fetchForUser(session.sub),
@@ -295,7 +316,7 @@ class OrbiServer {
 
     // --- PAGINATED LEDGER ---
     async getTransactionsPaginated(userId: string, limit: number, offset: number) {
-        return this.ledger.getLatestTransactions(userId, limit, offset);
+        return this.ledger.getMobileTransactions(userId, limit, offset);
     }
 
     async getTransactionForUser(userId: string, transactionId: string) {
@@ -356,7 +377,7 @@ class OrbiServer {
         throw new Error('SETTLEMENT_BREAKDOWN_PROVIDER_NOT_CONFIGURED');
     }
 
-    async processSecurePayment(payload: any, user?: any) {
+    async processSecurePayment(payload: any, user?: any, serverFxQuote?: Record<string, unknown>) {
         const sessionUser = user || (await this.auth.getSession())?.user;
         if (!sessionUser) throw new Error("IDENTITY_REQUIRED");
         const requestCurrency = typeof payload?.currency === 'string'
@@ -381,7 +402,7 @@ class OrbiServer {
             category: payload.category,
             categoryId: payload.categoryId,
             metadata: payload.metadata
-        } as any);
+        } as any, serverFxQuote);
 
         if (result?.success && result.transaction) {
             await ServiceActorOps.handleTransactionPosted(sessionUser, payload, result.transaction);
@@ -1021,8 +1042,12 @@ class OrbiServer {
     // --- MULTI-TENANT MERCHANT ACCOUNTS ---
     async createMerchantAccount(userId: string, data: any) { return MerchantAccounts.createMerchant(userId, data); }
     async getUserMerchantAccounts(userId: string) { return MerchantAccounts.getUserMerchants(userId); }
-    async getMerchantAccountById(merchantId: string) { return MerchantAccounts.getMerchantById(merchantId); }
-    async updateMerchantSettlement(merchantId: string, data: any) { return MerchantAccounts.updateSettlementInfo(merchantId, data); }
+    async getMerchantAccountById(merchantId: string, actorUserId: string, privileged = false) {
+        return MerchantAccounts.getMerchantById(merchantId, { actorUserId, privileged });
+    }
+    async updateMerchantSettlement(merchantId: string, data: any, actorUserId: string, privileged = false) {
+        return MerchantAccounts.updateSettlementInfo(merchantId, data, { actorUserId, privileged });
+    }
     async getMerchantTransactions(userId: string, limit: number = 50, offset: number = 0) {
         const transactions = await ServiceActorOps.getMerchantTransactions(userId, limit, offset);
         if (transactions.length > 0) {
@@ -1151,7 +1176,7 @@ class OrbiServer {
     // --- FINANCIAL CORE ENGINE (MULTI-TENANT) ---
     async createTenant(userId: string, data: any) { return FinancialCore.createTenant(userId, data); }
     async getUserTenants(userId: string) { return FinancialCore.getUserTenants(userId); }
-    async generateTenantApiKeys(userId: string, tenantId: string, type?: 'test' | 'live') { return FinancialCore.generateApiKeys(userId, tenantId, type); }
+    async generateTenantApiKeys(userId: string, tenantId: string, type: 'test' | 'live' = 'test') { return FinancialCore.generateApiKeys(userId, tenantId, type); }
     async getTenantApiKeys(userId: string, tenantId: string) { return FinancialCore.getApiKeys(userId, tenantId); }
     async revokeTenantApiKey(userId: string, tenantId: string, keyId: string) { return FinancialCore.revokeApiKey(userId, tenantId, keyId); }
     async getTenantWallets(userId: string, tenantId: string) { return FinancialCore.getTenantWallets(userId, tenantId); }
@@ -1633,6 +1658,42 @@ class OrbiServer {
         return Number(count || 0);
     }
 
+    private async notifyOrganizationUsers(userIds: string[], subject: string, body: string, variables: Record<string, any>) {
+        const sb = getAdminSupabase();
+        if (!sb) throw new Error('DB_OFFLINE: Governance notifications require durable delivery state.');
+        const eventCode = String(variables.eventCode || '').trim().toUpperCase();
+        const eventId = String(variables.eventId || variables.requestId || variables.caseId || '').trim();
+        if (!eventCode || !eventId) throw new Error('NOTIFICATION_EVENT_REQUIRED: eventCode and eventId are required.');
+        await Promise.all([...new Set(userIds.filter(Boolean))].map((userId) =>
+            Messaging.dispatch(userId, 'security', subject, body, {
+                push: true,
+                sms: true,
+                email: true,
+                systemCustomBypass: true,
+                mandatory: true,
+                eventCode,
+                idempotencyKey: `${eventCode}:${eventId}`,
+                variables,
+                localized: variables.localized,
+                metadata: { organizationId: variables.orgId, eventId, eventCode },
+            }).catch(async (error: any) => {
+                try {
+                    await sb.rpc('finish_notification_delivery_v1', {
+                        p_event_key: `${eventCode}:${eventId}`,
+                        p_recipient_user_id: userId,
+                        p_status: 'FAILED',
+                        p_error: String(error?.message || error),
+                    });
+                } catch {
+                    // Preserve the original delivery failure as the actionable signal.
+                }
+                console.warn('[Organization] Governance notification deferred', {
+                    userId, eventCode, eventId, code: String(error?.code || error?.message || ''),
+                });
+            })
+        ));
+    }
+
     private async notifyOrganizationMembers(orgId: string, subject: string, body: string, variables: Record<string, any> = {}) {
         const sb = getAdminSupabase();
         if (!sb) return;
@@ -1641,21 +1702,9 @@ class OrbiServer {
             .select('id')
             .eq('organization_id', orgId)
             .eq('account_status', 'active');
-        await Promise.all((members || []).map((member: any) =>
-            Messaging.dispatch(String(member.id), 'info', subject, body, {
-                push: true,
-                sms: false,
-                email: true,
-                eventCode: variables.eventCode || 'ORGANIZATION_GOVERNANCE_UPDATED',
-                variables,
-            }).catch((error: any) => {
-                console.warn('[Organization] Member notification deferred', {
-                    orgId,
-                    userId: member.id,
-                    code: String(error?.code || error?.message || ''),
-                });
-            })
-        ));
+        await this.notifyOrganizationUsers((members || []).map((member: any) => String(member.id)), subject, body, {
+            ...variables, orgId,
+        });
     }
 
     private async ensureOrganizationRoleDefinitions(orgId: string, actorId: string) {
@@ -1720,7 +1769,7 @@ class OrbiServer {
             data.id,
             'Organization created',
             `${payload.name} organization profile was created and governance roles are ready.`,
-            { orgId: data.id, orgName: payload.name, actorId, eventCode: 'ORGANIZATION_CREATED' },
+            { orgId: data.id, orgName: payload.name, actorId, eventId: data.id, eventCode: 'ORGANIZATION_CREATED' },
         );
         return { success: true, data };
     }
@@ -1733,96 +1782,121 @@ class OrbiServer {
         return [data.organizations];
     }
 
-    async linkUserToOrganization(userId: string, orgId: string, role: string, actorId: string) {
+    async linkUserToOrganization(userId: string, orgId: string, role: string, actorId: string, reason = 'Organization membership invitation requested') {
         const sb = getAdminSupabase();
         if (!sb) return { error: 'DB_OFFLINE' };
         const normalizedRole = this.normalizeOrgRole(role);
-
-        // 1. Security Check: Ensure the actor is an ADMIN of this specific organization
-        const { data: actor } = await sb.from('users').select('organization_id, org_role').eq('id', actorId).single();
-        if (!actor || actor.organization_id !== orgId || this.normalizeOrgRole(actor.org_role) !== 'ADMIN') {
-            return { error: 'UNAUTHORIZED: Only Organization Admins can manage team members.' };
-        }
-        if (normalizedRole === 'ADMIN') {
-            return this.requestOrganizationAdminChange(orgId, {
-                action: 'ADD_ADMIN',
-                target_user_id: userId,
-                reason: 'New organization admin assignment requires three leader approvals.',
-            }, actorId);
-        }
-
-        // 2. Link the user and assign the role
-        const { error } = await sb.from('users').update({
-            organization_id: orgId,
-            org_role: normalizedRole
-        }).eq('id', userId);
-
+        const { data, error } = await sb.rpc('request_organization_invitation_v1', {
+            p_actor_id: actorId, p_organization_id: orgId, p_target_user_id: userId,
+            p_role: normalizedRole, p_reason: reason,
+        });
         if (error) return { error: error.message };
-        await this.security.logActivity(actorId, 'USER_ORG_LINKED', 'success', `Linked user ${userId} to org ${orgId} as ${normalizedRole}`);
-        await this.notifyOrganizationMembers(
-            orgId,
-            'Organization member updated',
-            `A member role was updated to ${normalizedRole}.`,
-            { orgId, userId, role: normalizedRole, actorId, eventCode: 'ORGANIZATION_MEMBER_ROLE_UPDATED' },
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_INVITATION_REQUESTED', {
+            organizationId: orgId, targetUserId: userId, role: normalizedRole,
+            invitationId: data?.invitation_id,
+        }, data?.invitation_id);
+        await this.notifyOrganizationUsers(
+            [userId],
+            'Organization invitation',
+            `You were invited to join an organization as ${normalizedRole}. Review this invitation before it expires.`,
+            {
+                orgId, role: normalizedRole, actorId, requestId: data?.invitation_id,
+                eventCode: 'ORGANIZATION_INVITATION_REQUESTED',
+                localized: { sw: { subject: 'Mwaliko wa shirika', body: `Umealikwa kujiunga na shirika kama ${normalizedRole}. Kagua mwaliko huu kabla muda wake haujaisha.` } },
+            },
         );
-        return { success: true };
+        return { success: true, data };
     }
 
-    async inviteUserByEmail(email: string, orgId: string, role: string, actorId: string) {
+    async inviteUserByEmail(email: string, orgId: string, role: string, actorId: string, reason = 'Organization membership invitation requested') {
         const sb = getAdminSupabase();
         if (!sb) return { error: 'DB_OFFLINE' };
 
-        // 1. Security Check: Ensure the actor is an ADMIN of this specific organization
-        const { data: actor } = await sb.from('users').select('organization_id, org_role, organizations(name)').eq('id', actorId).single();
         const normalizedRole = this.normalizeOrgRole(role);
-        if (!actor || actor.organization_id !== orgId || this.normalizeOrgRole(actor.org_role) !== 'ADMIN') {
-            return { error: 'UNAUTHORIZED: Only Organization Admins can invite team members.' };
-        }
-
-        // 2. Find the user by email
-        const { data: targetUser } = await sb.from('users').select('id, full_name').eq('email', email).single();
+        const { data: targetUser } = await sb.from('users').select('id').eq('email', email).single();
         if (!targetUser) {
             return { error: 'USER_NOT_FOUND: No Orbi account found with this email. They must register first.' };
         }
-        if (normalizedRole === 'ADMIN') {
-            return this.requestOrganizationAdminChange(orgId, {
-                action: 'ADD_ADMIN',
-                target_user_id: targetUser.id,
-                reason: 'New organization admin invitation requires three leader approvals.',
-            }, actorId);
-        }
+        const result = await this.linkUserToOrganization(targetUser.id, orgId, normalizedRole, actorId, reason);
+        if (result.error) return result;
+        return { ...result, userId: targetUser.id };
+    }
 
-        // 3. Link the user
-        const { error } = await sb.from('users').update({
-            organization_id: orgId,
-            org_role: normalizedRole
-        }).eq('id', targetUser.id);
-
+    async respondOrganizationInvitation(invitationId: string, decision: 'ACCEPT' | 'DECLINE', actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('respond_organization_invitation_v1', {
+            p_actor_id: actorId, p_invitation_id: invitationId, p_decision: decision,
+        });
         if (error) return { error: error.message };
-        
-        // 4. Send Real-Time Push Notification to the invited user
-        const orgName = (actor.organizations as any)?.name || 'an organization';
-        await Messaging.dispatch(
-            targetUser.id,
-            'info',
-            'You have been added to an Organization',
-            `You have been invited to join ${orgName} as a ${normalizedRole}. Your corporate wallet is now active.`,
-            { 
-                sms: true,
-                email: true,
-                template: 'Org_Invitation',
-                variables: { orgName, role: normalizedRole }
-            }
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_INVITATION_RESPONDED', {
+            invitationId, decision, status: data?.status, organizationId: data?.organization_id,
+        }, invitationId);
+        if (data?.organization_id) await this.notifyOrganizationMembers(
+            data.organization_id,
+            'Organization invitation updated',
+            `An organization invitation was ${decision === 'ACCEPT' ? 'accepted' : 'declined'}.`,
+            {
+                requestId: invitationId, eventCode: 'ORGANIZATION_INVITATION_RESPONDED', decision,
+                localized: { sw: { subject: 'Mwaliko wa shirika umebadilishwa', body: `Mwaliko wa shirika ${decision === 'ACCEPT' ? 'umekubaliwa' : 'umekataliwa'}.` } },
+            },
         );
+        return { success: true, data };
+    }
 
-        await this.security.logActivity(actorId, 'USER_ORG_INVITED', 'success', `Invited user ${email} to org ${orgId} as ${normalizedRole}`);
+    async requestOrganizationMemberChange(orgId: string, input: {
+        targetUserId: string; action: 'CHANGE_ROLE' | 'REMOVE_MEMBER';
+        toRole?: 'MEMBER' | 'MANAGER' | 'ACCOUNTANT' | null; reason: string;
+    }, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('request_organization_member_change_v1', {
+            p_actor_id: actorId, p_organization_id: orgId, p_target_user_id: input.targetUserId,
+            p_action: input.action, p_to_role: input.toRole || null, p_reason: input.reason,
+        });
+        if (error) return { error: error.message };
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_MEMBER_CHANGE_REQUESTED', {
+            requestId: data, organizationId: orgId, ...input,
+        }, data);
         await this.notifyOrganizationMembers(
             orgId,
-            'Organization invitation accepted',
-            `${targetUser.full_name || email} was added as ${normalizedRole}.`,
-            { orgId, userId: targetUser.id, role: normalizedRole, actorId, eventCode: 'ORGANIZATION_MEMBER_ADDED' },
+            'Member change requires review',
+            `A request to ${input.action === 'REMOVE_MEMBER' ? 'remove a member' : 'change a member role'} is awaiting an independent review.`,
+            {
+                requestId: data, targetUserId: input.targetUserId, action: input.action,
+                eventCode: 'ORGANIZATION_MEMBER_CHANGE_REQUESTED',
+                localized: { sw: { subject: 'Mabadiliko ya mwanachama yanahitaji uhakiki', body: `Ombi la ${input.action === 'REMOVE_MEMBER' ? 'kumwondoa mwanachama' : 'kubadili nafasi ya mwanachama'} linasubiri uhakiki wa mtu mwingine.` } },
+            },
         );
-        return { success: true, userId: targetUser.id };
+        return { success: true, data: { requestId: data } };
+    }
+
+    async respondOrganizationMemberChange(requestId: string, input: {
+        decision: 'APPROVE' | 'REJECT'; reason: string;
+    }, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('respond_organization_member_change_v1', {
+            p_reviewer_id: actorId, p_request_id: requestId,
+            p_decision: input.decision, p_reason: input.reason,
+        });
+        if (error) return { error: error.message };
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_MEMBER_CHANGE_REVIEWED', {
+            requestId, decision: input.decision, reason: input.reason, status: data?.status,
+        }, requestId);
+        const { data: memberRequest } = await sb.from('organization_role_change_requests')
+            .select('organization_id').eq('id', requestId).maybeSingle();
+        if (memberRequest?.organization_id) await this.notifyOrganizationMembers(
+            memberRequest.organization_id,
+            'Member change reviewed',
+            `A member change request was ${String(data?.status || input.decision).toLowerCase()}.`,
+            {
+                requestId, decision: input.decision, status: data?.status,
+                eventCode: 'ORGANIZATION_MEMBER_CHANGE_REVIEWED',
+                localized: { sw: { subject: 'Mabadiliko ya mwanachama yamehakikiwa', body: `Ombi la mabadiliko ya mwanachama sasa lina hali ya ${String(data?.status || input.decision)}.` } },
+            },
+        );
+        return { success: true, data };
     }
 
     async createOrganizationRole(orgId: string, payload: any, actorId: string) {
@@ -1847,7 +1921,7 @@ class OrbiServer {
             orgId,
             'Organization role updated',
             `A role named ${data.role_name} was added or updated.`,
-            { orgId, role: roleKey, actorId, eventCode: 'ORGANIZATION_ROLE_UPDATED' },
+            { orgId, role: roleKey, actorId, eventId: data.id, eventCode: 'ORGANIZATION_ROLE_UPDATED' },
         );
         return { success: true, data };
     }
@@ -1855,121 +1929,206 @@ class OrbiServer {
     async requestOrganizationAdminChange(orgId: string, payload: any, actorId: string) {
         const sb = getAdminSupabase();
         if (!sb) return { error: 'DB_OFFLINE' };
-        const action = String(payload.action || 'REMOVE_ADMIN').toUpperCase();
+        const action = String(payload.action || '').trim().toUpperCase();
         const targetUserId = String(payload.targetUserId || payload.target_user_id || '');
-        if (!targetUserId) return { error: 'TARGET_USER_REQUIRED' };
-        const { data: actor } = await sb.from('users').select('organization_id, org_role').eq('id', actorId).single();
-        if (!actor || actor.organization_id !== orgId || this.normalizeOrgRole(actor.org_role) !== 'ADMIN') {
-            return { error: 'UNAUTHORIZED: Only Organization Admins can request admin changes.' };
-        }
-        const { data: target } = await sb.from('users').select('id, org_role').eq('id', targetUserId).eq('organization_id', orgId).single();
-        if (!target) return { error: 'ORG_TARGET_NOT_FOUND' };
-        if (action === 'REMOVE_ADMIN' && this.normalizeOrgRole(target.org_role) === 'ADMIN') {
-            const adminCount = await this.countOrganizationAdmins(orgId);
-            if (adminCount <= 1) return { error: 'ORG_ADMIN_MIN_REQUIRED' };
-        }
-        if (action === 'ADD_ADMIN' || action === 'TRANSFER_PRIMARY_ADMIN') {
-            const adminCount = await this.countOrganizationAdmins(orgId);
-            if (adminCount >= 2 && this.normalizeOrgRole(target.org_role) !== 'ADMIN') {
-                return { error: 'ORG_ADMIN_MAX_REACHED' };
-            }
-        }
-        const { data, error } = await sb.from('organization_role_change_requests').insert({
-            organization_id: orgId,
-            target_user_id: targetUserId,
-            requested_by: actorId,
-            action,
-            from_role: this.normalizeOrgRole(target.org_role),
-            to_role: action === 'REMOVE_ADMIN' ? (payload.to_role || 'MANAGER') : 'ADMIN',
-            required_approvals: 3,
-            reason: payload.reason || null,
-            metadata: { requested_from: 'mobile_or_admin_portal' },
-        }).select('*').single();
+        const { data, error } = await sb.rpc('request_organization_leadership_change_v1', {
+            p_actor_id: actorId, p_organization_id: orgId, p_target_user_id: targetUserId,
+            p_action: action, p_to_role: payload.toRole || payload.to_role || null,
+            p_reason: payload.reason,
+        });
         if (error) return { error: error.message };
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_LEADERSHIP_CHANGE_REQUESTED', {
+            requestId: data?.request_id, organizationId: orgId, targetUserId, action,
+            requiredReviews: data?.required_reviews, reason: payload.reason,
+        }, data?.request_id);
         await this.notifyOrganizationMembers(
             orgId,
-            'Organization admin change requested',
-            'A leadership change request has been created and needs three leader approvals.',
-            { orgId, requestId: data.id, action, targetUserId, actorId, eventCode: 'ORGANIZATION_ADMIN_CHANGE_REQUESTED' },
+            'Leadership change requires approval',
+            `A protected leadership change (${action}) is awaiting independent approvals.`,
+            {
+                requestId: data?.request_id, targetUserId, action,
+                eventCode: 'ORGANIZATION_LEADERSHIP_CHANGE_REQUESTED',
+                localized: { sw: { subject: 'Badiliko la uongozi linahitaji idhini', body: `Badiliko la uongozi lililolindwa (${action}) linasubiri idhini huru.` } },
+            },
+        );
+        return { success: true, data };
+    }
+    async respondOrganizationAdminChange(requestId: string, payload: any, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const decision = String(payload.decision || payload.action || '').trim().toUpperCase();
+        const reason = String(payload.reason || payload.note || '').trim();
+        const { data, error } = await sb.rpc('respond_organization_leadership_change_v1', {
+            p_reviewer_id: actorId, p_request_id: requestId, p_decision: decision, p_reason: reason,
+        });
+        if (error) return { error: error.message };
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_LEADERSHIP_CHANGE_REVIEWED', {
+            requestId, decision, reason, status: data?.status,
+        }, requestId);
+        const { data: leadershipRequest } = await sb.from('organization_role_change_requests')
+            .select('organization_id').eq('id', requestId).maybeSingle();
+        if (leadershipRequest?.organization_id) await this.notifyOrganizationMembers(
+            leadershipRequest.organization_id,
+            'Leadership change reviewed',
+            `A protected leadership change now has status ${String(data?.status || decision)}.`,
+            {
+                requestId, decision, status: data?.status,
+                eventCode: 'ORGANIZATION_LEADERSHIP_CHANGE_REVIEWED',
+                localized: { sw: { subject: 'Badiliko la uongozi limehakikiwa', body: `Badiliko la uongozi lililolindwa sasa lina hali ya ${String(data?.status || decision)}.` } },
+            },
         );
         return { success: true, data };
     }
 
-    async respondOrganizationAdminChange(requestId: string, payload: any, actorId: string) {
+    async requestOrganizationRecovery(orgId: string, input: any, actorId: string) {
         const sb = getAdminSupabase();
         if (!sb) return { error: 'DB_OFFLINE' };
-        const action = String(payload.action || '').toUpperCase();
-        if (!['APPROVE', 'REJECT'].includes(action)) return { error: 'INVALID_ACTION' };
-        const { data: request } = await sb.from('organization_role_change_requests').select('*').eq('id', requestId).single();
-        if (!request) return { error: 'REQUEST_NOT_FOUND' };
-        if (String(request.status).toUpperCase() !== 'PENDING') return { error: 'REQUEST_NOT_PENDING' };
-        const { data: actor } = await sb.from('users').select('organization_id, org_role').eq('id', actorId).single();
-        if (!actor || actor.organization_id !== request.organization_id || !this.canLeadOrganization(actor.org_role)) {
-            return { error: 'UNAUTHORIZED: Only Admins or Signatories can approve leadership changes.' };
-        }
-        if (String(request.target_user_id) === actorId) return { error: 'SELF_APPROVAL_DENIED' };
-        const approvals = Array.isArray(request.approvals) ? request.approvals : [];
-        if (approvals.some((item: any) => String(item.user_id) === actorId)) return { error: 'ALREADY_REVIEWED' };
-        const updatedApprovals = [...approvals, {
-            user_id: actorId,
-            role: this.normalizeOrgRole(actor.org_role),
-            action,
-            note: payload.note || null,
-            at: new Date().toISOString(),
-        }];
-        if (action === 'REJECT') {
-            const { data, error } = await sb.from('organization_role_change_requests').update({
-                approvals: updatedApprovals,
-                status: 'REJECTED',
-                decided_at: new Date().toISOString(),
-                updated_at: new Date().toISOString(),
-            }).eq('id', requestId).select('*').single();
-            if (error) return { error: error.message };
-            await this.notifyOrganizationMembers(request.organization_id, 'Organization admin change rejected', 'A leadership change request was rejected.', { orgId: request.organization_id, requestId, actorId, eventCode: 'ORGANIZATION_ADMIN_CHANGE_REJECTED' });
-            return { success: true, data };
-        }
-        const approvalCount = updatedApprovals.filter((item: any) => item.action === 'APPROVE').length;
-        if (approvalCount < Number(request.required_approvals || 3)) {
-            const { data, error } = await sb.from('organization_role_change_requests').update({
-                approvals: updatedApprovals,
-                updated_at: new Date().toISOString(),
-            }).eq('id', requestId).select('*').single();
-            if (error) return { error: error.message };
-            return { success: true, data, requires_more_approvals: true };
-        }
-        if (request.action === 'REMOVE_ADMIN') {
-            if (this.normalizeOrgRole(request.from_role) === 'ADMIN') {
-                const adminCount = await this.countOrganizationAdmins(request.organization_id);
-                if (adminCount <= 1) return { error: 'ORG_ADMIN_MIN_REQUIRED' };
-            }
-            await sb.from('users').update({ org_role: request.to_role || 'MANAGER' }).eq('id', request.target_user_id).eq('organization_id', request.organization_id);
-        } else if (request.action === 'ADD_ADMIN') {
-            const adminCount = await this.countOrganizationAdmins(request.organization_id);
-            if (adminCount >= 2) {
-                const { data: target } = await sb.from('users').select('org_role').eq('id', request.target_user_id).eq('organization_id', request.organization_id).single();
-                if (this.normalizeOrgRole(target?.org_role) !== 'ADMIN') return { error: 'ORG_ADMIN_MAX_REACHED' };
-            }
-            await sb.from('users').update({ org_role: 'ADMIN' }).eq('id', request.target_user_id).eq('organization_id', request.organization_id);
-        } else if (request.action === 'TRANSFER_PRIMARY_ADMIN') {
-            const adminCount = await this.countOrganizationAdmins(request.organization_id);
-            if (adminCount >= 2) {
-                const { data: target } = await sb.from('users').select('org_role').eq('id', request.target_user_id).eq('organization_id', request.organization_id).single();
-                if (this.normalizeOrgRole(target?.org_role) !== 'ADMIN') return { error: 'ORG_ADMIN_MAX_REACHED' };
-            }
-            await sb.from('organizations').update({ primary_admin_user_id: request.target_user_id, updated_at: new Date().toISOString() }).eq('id', request.organization_id);
-            await sb.from('users').update({ org_role: 'ADMIN' }).eq('id', request.target_user_id).eq('organization_id', request.organization_id);
-        }
-        const { data, error } = await sb.from('organization_role_change_requests').update({
-            approvals: updatedApprovals,
-            status: 'EXECUTED',
-            decided_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-        }).eq('id', requestId).select('*').single();
+        const { data, error } = await sb.rpc('request_organization_recovery_v1', {
+            p_actor_id: actorId, p_organization_id: orgId, p_beneficiary_id: input.beneficiaryUserId,
+            p_incident_reference: input.incidentReference, p_reason: input.reason,
+            p_evidence: input.evidence || {},
+        });
         if (error) return { error: error.message };
-        await this.notifyOrganizationMembers(request.organization_id, 'Organization leadership updated', 'A leadership change was approved and applied.', { orgId: request.organization_id, requestId, actorId, eventCode: 'ORGANIZATION_ADMIN_CHANGE_EXECUTED' });
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_RECOVERY_REQUESTED', {
+            caseId: data, organizationId: orgId, beneficiaryUserId: input.beneficiaryUserId,
+            incidentReference: input.incidentReference,
+        }, data);
+        const [{ data: leaders }, { data: externalReviewers }] = await Promise.all([
+            sb.from('users').select('id').eq('organization_id', orgId).eq('account_status', 'active').in('org_role', ['ADMIN', 'SIGNATORY']),
+            sb.from('users').select('id').eq('role', 'SUPER_ADMIN').eq('account_status', 'active'),
+        ]);
+        await this.notifyOrganizationUsers(
+            [...(leaders || []).map((u: any) => String(u.id)), ...(externalReviewers || []).map((u: any) => String(u.id)), String(input.beneficiaryUserId)],
+            'Critical organization recovery requested',
+            `Recovery case ${data} is cooling down and requires an external review. Do not approve it unless you independently verified the incident.`,
+            {
+                orgId, caseId: data, beneficiaryUserId: input.beneficiaryUserId,
+                eventCode: 'ORGANIZATION_RECOVERY_REQUESTED',
+                localized: { sw: { subject: 'Urejeshaji muhimu wa shirika umeombwa', body: `Kesi ya urejeshaji ${data} iko kwenye muda wa kusubiri na inahitaji uhakiki wa nje. Usiidhinishe bila kuthibitisha tukio kwa njia huru.` } },
+            },
+        );
+        return { success: true, data: { caseId: data } };
+    }
+
+    async requestOrganizationRecoveryContact(orgId: string, input: any, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('request_organization_recovery_contact_v1', {
+            p_actor_id: actorId, p_organization_id: orgId, p_contact_user_id: input.contactUserId,
+            p_contact_type: input.contactType, p_reason: input.reason,
+        });
+        if (error) return { error: error.message };
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_RECOVERY_CONTACT_REQUESTED', {
+            organizationId: orgId, contactId: data, contactUserId: input.contactUserId, contactType: input.contactType,
+        }, data);
+        const { data: reviewers } = await sb.from('users').select('id').eq('role', 'SUPER_ADMIN').eq('account_status', 'active');
+        await this.notifyOrganizationUsers(
+            [String(input.contactUserId), ...(reviewers || []).map((u: any) => String(u.id))],
+            'Recovery contact verification required',
+            'A recovery contact enrollment requires independent verification before it can protect the organization.',
+            { orgId, eventId: data, contactUserId: input.contactUserId, eventCode: 'ORGANIZATION_RECOVERY_CONTACT_REQUESTED', localized: { sw: { subject: 'Uthibitishaji wa mawasiliano ya urejeshaji unahitajika', body: 'Usajili wa mawasiliano ya urejeshaji unahitaji uthibitishaji huru kabla haujaanza kulinda shirika.' } } },
+        );
+        return { success: true, data: { contactId: data } };
+    }
+
+    async requestOrganizationRecoveryContactRevocation(contactId: string, reason: string, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('request_organization_recovery_contact_revocation_v1', {
+            p_actor_id: actorId, p_contact_id: contactId, p_reason: reason,
+        });
+        if (error) return { error: error.message };
+        const { data: contact } = await sb.from('organization_recovery_contacts').select('organization_id,contact_user_id').eq('id', contactId).single();
+        const { data: reviewers } = await sb.from('users').select('id').eq('role', 'SUPER_ADMIN').eq('account_status', 'active');
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_RECOVERY_CONTACT_REVOCATION_REQUESTED', { contactId, organizationId: contact?.organization_id }, contactId);
+        await this.notifyOrganizationUsers(
+            [...(reviewers || []).map((u: any) => String(u.id)), String(contact?.contact_user_id || '')],
+            'Recovery contact revocation requires review',
+            'A verified recovery contact revocation is awaiting independent review.',
+            { orgId: contact?.organization_id, eventId: data, contactId, eventCode: 'ORGANIZATION_RECOVERY_CONTACT_REVOCATION_REQUESTED', localized: { sw: { subject: 'Kuondoa mawasiliano ya urejeshaji kunahitaji uhakiki', body: 'Ombi la kuondoa mawasiliano ya urejeshaji yaliyothibitishwa linasubiri uhakiki huru.' } } },
+        );
+        return { success: true, data: { contactId: data } };
+    }
+
+    async respondOrganizationRecoveryContact(contactId: string, input: any, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('respond_organization_recovery_contact_v1', {
+            p_reviewer_id: actorId, p_contact_id: contactId, p_decision: input.decision, p_reason: input.reason,
+        });
+        if (error) return { error: error.message };
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_RECOVERY_CONTACT_REVIEWED', { contactId, decision: input.decision, status: data?.status }, contactId);
+        await this.notifyOrganizationUsers(
+            [String(data?.contact_user_id || ''), String(data?.requested_by || ''), String(data?.revocation_requested_by || '')],
+            'Recovery contact reviewed',
+            `Recovery contact ${contactId} now has status ${String(data?.status)}.`,
+            { orgId: data?.organization_id, eventId: contactId, contactId, status: data?.status, eventCode: 'ORGANIZATION_RECOVERY_CONTACT_REVIEWED', localized: { sw: { subject: 'Mawasiliano ya urejeshaji yamehakikiwa', body: `Mawasiliano ya urejeshaji ${contactId} sasa yana hali ya ${String(data?.status)}.` } } },
+        );
         return { success: true, data };
     }
 
+    async requestOrganizationReactivation(orgId: string, input: any, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('request_organization_reactivation_v1', {
+            p_actor_id: actorId, p_organization_id: orgId, p_target_user_id: input.targetUserId,
+            p_reason: input.reason, p_evidence: input.evidence,
+        });
+        if (error) return { error: error.message };
+        const { data: reviewers } = await sb.from('users').select('id').eq('role', 'SUPER_ADMIN').eq('account_status', 'active');
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_REACTIVATION_REQUESTED', { organizationId: orgId, caseId: data, targetUserId: input.targetUserId }, data);
+        await this.notifyOrganizationUsers(
+            [String(input.targetUserId), ...(reviewers || []).map((u: any) => String(u.id))],
+            'Account reactivation requires external review',
+            `Reactivation case ${data} is cooling down. Approval requires independent verification of identity, credentials, and incident closure.`,
+            { orgId, caseId: data, targetUserId: input.targetUserId, eventCode: 'ORGANIZATION_REACTIVATION_REQUESTED', localized: { sw: { subject: 'Kuwasha akaunti kunahitaji uhakiki wa nje', body: `Kesi ya kuwasha akaunti ${data} iko kwenye muda wa kusubiri. Idhini inahitaji uthibitishaji huru wa utambulisho, credentials na kufungwa kwa tukio.` } } },
+        );
+        return { success: true, data: { caseId: data } };
+    }
+
+    async respondOrganizationReactivation(caseId: string, input: any, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('respond_organization_reactivation_v1', {
+            p_reviewer_id: actorId, p_case_id: caseId, p_decision: input.decision, p_reason: input.reason,
+        });
+        if (error) return { error: error.message };
+        const { data: reactivation } = await sb.from('organization_reactivation_cases').select('organization_id,requested_by,target_user_id').eq('id', caseId).single();
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_REACTIVATION_REVIEWED', { caseId, decision: input.decision, status: data?.status }, caseId);
+        await this.notifyOrganizationUsers(
+            [String(reactivation?.requested_by || ''), String(reactivation?.target_user_id || '')],
+            'Account reactivation reviewed',
+            `Reactivation case ${caseId} now has status ${String(data?.status || input.decision)}.`,
+            { orgId: reactivation?.organization_id, caseId, status: data?.status, eventCode: 'ORGANIZATION_REACTIVATION_REVIEWED', localized: { sw: { subject: 'Kuwasha akaunti kumehakikiwa', body: `Kesi ya kuwasha akaunti ${caseId} sasa ina hali ya ${String(data?.status || input.decision)}.` } } },
+        );
+        return { success: true, data };
+    }
+
+    async respondOrganizationRecovery(caseId: string, input: any, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.rpc('respond_organization_recovery_v1', {
+            p_reviewer_id: actorId, p_case_id: caseId,
+            p_decision: input.decision, p_reason: input.reason,
+        });
+        if (error) return { error: error.message };
+        await Audit.log('SECURITY', actorId, 'ORGANIZATION_RECOVERY_REVIEWED', {
+            caseId, decision: input.decision, status: data?.status,
+        }, caseId);
+        const { data: recoveryCase } = await sb.from('organization_recovery_cases')
+            .select('organization_id,requester_id,beneficiary_user_id').eq('id', caseId).maybeSingle();
+        if (recoveryCase) await this.notifyOrganizationUsers(
+            [String(recoveryCase.requester_id), String(recoveryCase.beneficiary_user_id)],
+            'Organization recovery reviewed',
+            `Recovery case ${caseId} now has status ${String(data?.status || input.decision)}.`,
+            {
+                orgId: recoveryCase.organization_id, caseId, status: data?.status, decision: input.decision,
+                eventCode: 'ORGANIZATION_RECOVERY_REVIEWED',
+                localized: { sw: { subject: 'Urejeshaji wa shirika umehakikiwa', body: `Kesi ya urejeshaji ${caseId} sasa ina hali ya ${String(data?.status || input.decision)}.` } },
+            },
+        );
+        return { success: true, data };
+    }
     async requestTreasuryWithdrawal(userId: string, goalId: string, amount: number, destinationWalletId: string, reason: string) {
         try {
             const txId = await Treasury.requestWithdrawal(userId, goalId, amount, destinationWalletId, reason);
@@ -1993,9 +2152,28 @@ class OrbiServer {
         return { isFullyApproved };
     }
 
-    async getOrganizationDetails(orgId: string) {
+    private async assertOrganizationAccess(
+        actorId: string,
+        orgId: string,
+        options: { privileged?: boolean; allowedOrgRoles?: string[] } = {},
+    ) {
+        const sb = getAdminSupabase();
+        if (!sb) throw new Error('DB_OFFLINE');
+        const { data: actor, error } = await sb
+            .from('users')
+            .select('organization_id, org_role, account_status')
+            .eq('id', actorId)
+            .maybeSingle();
+        if (error) throw new Error(error.message);
+        if (!canAccessOrganizationResource(actor, orgId, options)) {
+            throw new Error('ORGANIZATION_ACCESS_DENIED');
+        }
+    }
+
+    async getOrganizationDetails(orgId: string, actorId: string, privileged = false) {
         const sb = getAdminSupabase();
         if (!sb) return { error: 'DB_OFFLINE' };
+        await this.assertOrganizationAccess(actorId, orgId, { privileged });
         
         const { data: org } = await sb.from('organizations').select('*').eq('id', orgId).single();
         if (!org) return { error: 'NOT_FOUND' };
@@ -2014,14 +2192,115 @@ class OrbiServer {
         return { success: true, data: { ...org, members: members || [], goals: goals || [], roles: roles || [], admin_change_requests: adminChangeRequests || [] } };
     }
 
-    async getPendingApprovals(orgId: string) {
+    async getPendingApprovals(orgId: string, actorId: string, privileged = false) {
+        await this.assertOrganizationAccess(actorId, orgId, {
+            privileged,
+            allowedOrgRoles: ['ADMIN', 'FINANCE', 'ACCOUNTANT', 'SIGNATORY'],
+        });
         const data = await Treasury.getPendingApprovals(orgId);
         return { success: true, data };
     }
 
-    async configureAutoSweep(goalId: string, enabled: boolean, threshold: number) {
-        const success = await Treasury.configureAutoSweep(goalId, enabled, threshold);
-        return { success };
+    async getTreasuryPolicy(orgId: string, currency: string, actorId: string) {
+        await this.assertOrganizationAccess(actorId, orgId);
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data, error } = await sb.from('treasury_policies').select('*')
+            .eq('organization_id', orgId).eq('currency', currency).eq('is_active', true).maybeSingle();
+        if (error) throw new Error(error.message);
+        return { success: true, data };
+    }
+
+    async upsertTreasuryPolicy(input: {
+        organizationId: string; currency: string; name: string; description?: string | null;
+        minApprovals: number; maxAmountPerTx?: number | null; dailyLimit?: number | null; reason: string;
+    }, actorId: string) {
+        const sb = getAdminSupabase();
+        if (!sb) throw new Error('DB_OFFLINE');
+        const { data, error } = await sb.rpc('upsert_treasury_policy_v1', {
+            p_actor_id: actorId, p_organization_id: input.organizationId, p_currency: input.currency,
+            p_name: input.name, p_description: input.description || null,
+            p_min_approvals: input.minApprovals, p_max_amount_per_tx: input.maxAmountPerTx ?? null,
+            p_daily_limit: input.dailyLimit ?? null, p_change_reason: input.reason,
+        });
+        if (error) throw new Error(error.message);
+        await Audit.log('SECURITY', actorId, 'TREASURY_POLICY_UPDATED', {
+            organizationId: input.organizationId, currency: input.currency,
+            policyId: data?.policy_id, version: data?.version, reason: input.reason,
+        }, data?.policy_id);
+        return { success: true, data };
+    }
+
+    async requestTreasuryApproverChange(input: { organizationId:string; targetUserId:string; action:'ADD'|'REMOVE'; reason:string }, actorId:string) {
+        const sb=getAdminSupabase(); if(!sb) throw new Error('DB_OFFLINE');
+        const {data,error}=await sb.rpc('request_treasury_approver_change_v1',{p_actor_id:actorId,p_organization_id:input.organizationId,p_target_user_id:input.targetUserId,p_action:input.action,p_reason:input.reason});
+        if(error) throw new Error(error.message);
+        await Audit.log('SECURITY',actorId,'TREASURY_APPROVER_CHANGE_REQUESTED',{requestId:data,organizationId:input.organizationId,targetUserId:input.targetUserId,action:input.action,reason:input.reason},data);
+        return {success:true,data:{requestId:data}};
+    }
+
+    async respondTreasuryApproverChange(requestId:string,input:{decision:'APPROVE'|'REJECT';reason:string},actorId:string) {
+        const sb=getAdminSupabase(); if(!sb) throw new Error('DB_OFFLINE');
+        const {data,error}=await sb.rpc('respond_treasury_approver_change_v1',{p_reviewer_id:actorId,p_request_id:requestId,p_decision:input.decision,p_reason:input.reason});
+        if(error) throw new Error(error.message);
+        await Audit.log('SECURITY',actorId,'TREASURY_APPROVER_CHANGE_REVIEWED',{requestId,decision:input.decision,reason:input.reason},requestId);
+        return {success:true,data};
+    }
+
+    async configureAutoSweep(input: {goalId:string;enabled:boolean;threshold:number;frequency:string;timezone:string;nextRunAt:string;windowMinutes:number;reason:string}, actorId: string, privileged = false) {
+        const sb = getAdminSupabase();
+        if (!sb) return { error: 'DB_OFFLINE' };
+        const { data: goal, error } = await sb
+            .from('goals')
+            .select('id, organization_id, is_corporate')
+            .eq('id', input.goalId)
+            .maybeSingle();
+        if (error) throw new Error(error.message);
+        if (!goal || !goal.is_corporate || !goal.organization_id) throw new Error('ORGANIZATION_RESOURCE_NOT_FOUND');
+        await this.assertOrganizationAccess(actorId, goal.organization_id, {
+            privileged,
+            allowedOrgRoles: ['ADMIN'],
+        });
+        const requestId = await Treasury.requestAutoSweepChange(actorId, input);
+        return { success: true, data: { requestId, status: 'PENDING' } };
+    }
+
+    async respondAutoSweepChange(requestId:string,input:{decision:'APPROVE'|'REJECT';reason:string},actorId:string) {
+        const data = await Treasury.respondAutoSweepChange(actorId, requestId, input.decision, input.reason);
+        return { success: true, data };
+    }
+
+    async generateOrganizationStatement(orgId:string,input:{periodStart:string;periodEnd:string;timezone:string;reason:string},actorId:string) {
+        const sb=getAdminSupabase(); if(!sb) throw new Error('DB_OFFLINE');
+        await this.assertOrganizationAccess(actorId,orgId,{allowedOrgRoles:['ADMIN','FINANCE','ACCOUNTANT','SIGNATORY']});
+        const {data,error}=await sb.rpc('generate_organization_statement_v1',{p_actor_id:actorId,p_organization_id:orgId,p_period_start:input.periodStart,p_period_end:input.periodEnd,p_timezone:input.timezone,p_reason:input.reason});
+        if(error) throw new Error(error.message);
+        await Audit.log('FINANCIAL',actorId,'ORGANIZATION_STATEMENT_GENERATED',{organizationId:orgId,periodStart:input.periodStart,periodEnd:input.periodEnd,statementId:data?.statement_id,contentHash:data?.content_hash,replayed:data?.replayed},data?.statement_id);
+        try {
+            const {data:user}=await sb.from('users').select('language').eq('id',actorId).single();
+            const sw=user?.language==='sw';
+            await Messaging.dispatch(actorId,'info',sw?'Taarifa ya Fedha Imetengenezwa':'Organization statement ready',sw?'Taarifa ya fedha ya shirika lako imetengenezwa na iko tayari kukaguliwa.':'Your organization financial statement has been generated and is ready for review.',{push:true,sms:true,email:true,mandatory:true,systemCustomBypass:true,eventCode:'ORGANIZATION_STATEMENT_READY',idempotencyKey:`organization-statement:${data.statement_id}:ready:${actorId}`});
+        } catch(notificationError:any) { console.warn(`[OrganizationStatement] ${data?.statement_id} committed; notification deferred: ${notificationError.message}`); }
+        return {success:true,data};
+    }
+
+    async listOrganizationStatements(orgId:string,actorId:string) {
+        const sb=getAdminSupabase(); if(!sb) throw new Error('DB_OFFLINE');
+        await this.assertOrganizationAccess(actorId,orgId,{allowedOrgRoles:['ADMIN','FINANCE','ACCOUNTANT','SIGNATORY']});
+        const {data,error}=await sb.from('organization_statements').select('*').eq('organization_id',orgId).order('period_start',{ascending:false}).limit(100);
+        if(error) throw new Error(error.message); return {success:true,data:data||[]};
+    }
+
+    async getOrganizationStatement(statementId:string,actorId:string,offset=0,limit=100) {
+        const sb=getAdminSupabase(); if(!sb) throw new Error('DB_OFFLINE');
+        const safeOffset=Math.max(0,Math.trunc(offset)); const safeLimit=Math.min(500,Math.max(1,Math.trunc(limit)));
+        const {data:statement,error}=await sb.from('organization_statements').select('*').eq('id',statementId).maybeSingle();
+        if(error) throw new Error(error.message); if(!statement) throw new Error('ORGANIZATION_STATEMENT_NOT_FOUND');
+        await this.assertOrganizationAccess(actorId,statement.organization_id,{allowedOrgRoles:['ADMIN','FINANCE','ACCOUNTANT','SIGNATORY']});
+        const {data:lines,error:lineError}=await sb.from('organization_statement_lines').select('*').eq('statement_id',statementId).order('sequence_number',{ascending:true}).range(safeOffset,safeOffset+safeLimit-1);
+        if(lineError) throw new Error(lineError.message);
+        await Audit.log('FINANCIAL',actorId,'ORGANIZATION_STATEMENT_VIEWED',{statementId,organizationId:statement.organization_id,offset:safeOffset,limit:safeLimit},statementId);
+        return {success:true,data:{statement,lines:lines||[],page:{offset:safeOffset,limit:safeLimit,total:statement.line_count}}};
     }
 
     async getBudgetAlerts(orgId: string, limit: number = 50) {

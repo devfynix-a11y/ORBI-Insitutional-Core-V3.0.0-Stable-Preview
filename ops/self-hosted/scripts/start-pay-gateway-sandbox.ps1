@@ -134,7 +134,8 @@ docker create `
   -e PAYMENT_GATEWAY_OPERATOR_DISCOVERY_API_KEY=$(New-OrbiSecret 64) `
   -e PAYMENT_GATEWAY_PORTAL_AUTH_SECRET=$portalAuthSecret `
   -e PAYMENT_GATEWAY_SERVICE_ACCESS_TOKEN_SECRET=$serviceAccessTokenSecret `
-  -e PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER=https://sandbox-pay.orbifinancial.com `
+  -e PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER=https://auth.orbifinancial.com/realms/orbi-sandbox `
+  -e PAYMENT_GATEWAY_OIDC_IDENTITY_BACKCHANNEL_URL=http://orbi-keycloak:8080/realms/orbi-sandbox `
   -e PAYMENT_GATEWAY_OIDC_IDENTITY_AUDIENCE=orbi-pay-sandbox-identity `
   -e PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID=orbi-pay-sandbox-developers `
   -e PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE=orbi-pay-sandbox-api `
@@ -154,7 +155,7 @@ docker create `
   -e ORBI_CORE_TRUSTED_MERCHANT_SETTLEMENTS_PATH=/api/internal/pay-gateway/merchant-settlements `
   -e ORBI_CORE_CALLBACK_TIMEOUT_MS=30000 `
   -e PAYMENT_GATEWAY_WORKER_ID=orbi-payment-gateway-sandbox `
-  -e PAYMENT_GATEWAY_WORKER_SCOPES=gateway:events:write,gateway:service-payments:write,gateway:service-payments:result,gateway:identity:read,gateway:paysafe-balances:read,gateway:business-registration:write,gateway:payment-profiles:write,gateway:merchant-payments:read,gateway:merchant-settlements:read `
+  -e PAYMENT_GATEWAY_WORKER_SCOPES=gateway:events:write,gateway:service-payments:write,gateway:service-payments:result,gateway:identity:read,gateway:notifications:push,gateway:paysafe-balances:read,gateway:business-registration:write,gateway:payment-profiles:write,gateway:merchant-payments:read,gateway:merchant-settlements:read `
   -e WORKER_SIGNING_SECRET=$workerSigningSecret `
   -e WORKER_KEY_ID=payment-gateway-sandbox-v1 `
   -e PAYMENT_GATEWAY_INTERNAL_MTLS_ENABLED=$gatewayMtlsEnabled `

@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+const sql=readFileSync(new URL('../database/main.sql',import.meta.url),'utf8');
+const engine=readFileSync(new URL('../backend/core/FinancialCoreEngine.ts',import.meta.url),'utf8');
+const middleware=readFileSync(new URL('../backend/middleware/apiKeyAuth.ts',import.meta.url),'utf8');
+test('external credentials persist hashes only and return a secret once',()=>{assert.match(engine,/crypto\.randomBytes\(32\)/);assert.match(engine,/secret_key: null/);assert.match(engine,/secret_hash: secretHash/);assert.match(sql,/UPDATE public\.api_keys SET secret_key = NULL/);});
+test('runtime guard binds credentials to environment audience and least privilege scopes',()=>{assert.match(sql,/environment=p_environment AND audience=p_audience/);assert.match(sql,/v_key\.scopes @> p_required_scopes/);assert.match(middleware,/x-api-environment/);assert.match(middleware,/requiredScopes: \['wallets:read'\]/);});
+test('service keys require an active approved service in the requested environment',()=>{assert.match(sql,/s\.status='active'/);assert.match(sql,/p_environment=ANY\(s\.environments\)/);assert.match(sql,/s\.scopes_granted @> p_required_scopes/);});
+test('live issuance requires prior approval and lifecycle alerts use every channel',()=>{assert.match(engine,/LIVE_API_ACCESS_NOT_APPROVED/);assert.match(engine,/API_CREDENTIAL_ISSUED/);assert.match(engine,/API_CREDENTIAL_REVOKED/);assert.match(engine,/push: true, sms: true, email: true, mandatory: true/);});
+test('subject access requires unexpired purpose-bound consent',()=>{assert.match(sql,/EXTERNAL_API_CONSENT_CONTEXT_REQUIRED/);assert.match(sql,/p\.status='active'/);assert.match(sql,/p\.expires_at IS NULL OR p\.expires_at>NOW\(\)/);assert.match(sql,/consent_payload->>'purpose'/);});
+test('authorization RPC is service-role only',()=>{assert.match(sql,/REVOKE ALL ON FUNCTION public\.authorize_external_api_request_v1[\s\S]*FROM PUBLIC, anon, authenticated/);assert.match(sql,/GRANT EXECUTE[\s\S]*TO service_role/);});

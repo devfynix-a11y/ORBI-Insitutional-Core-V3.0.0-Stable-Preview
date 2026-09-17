@@ -7,6 +7,7 @@ import {
 import { GlobalTimeResolver } from '../../../backend/utils/GlobalTimeResolver.js';
 import { TransactionMovementClassifier } from '../../../backend/transactions/movement/TransactionMovementClassifier.js';
 import { DataProtection } from '../../../backend/security/DataProtection.js';
+import { signLockedFxSnapshot } from '../../../backend/ledger/FXLockedQuote.js';
 
 type Deps = {
   authenticate: RequestHandler;
@@ -1364,7 +1365,10 @@ export const registerCoreFinanceRoutes = (v1: Router, deps: Deps) => {
         });
       }
 
-      const result = await LogicCore.processSecurePayment(settlementPayload, session.user);
+      const serverFxQuote = String(settlementPayload.type || '').toUpperCase() === 'FX_CONVERSION'
+        ? binding.quote
+        : undefined;
+      const result = await LogicCore.processSecurePayment(settlementPayload, session.user, serverFxQuote);
       await LogicCore.markSettlementQuoteResult(session.sub, binding.quoteId, result);
 
       if (!result.success) {
@@ -1585,7 +1589,7 @@ export const registerCoreFinanceRoutes = (v1: Router, deps: Deps) => {
       };
       const quoteHash = hashFxQuotePayload(buildFxCanonicalIntent(requestPayload));
       const quoteSignature = signFxQuote(quoteId, quoteHash, result.expiresAt, session.sub);
-      const quoteSnapshot = {
+      const quoteSnapshot: Record<string, any> = {
         ...result,
         quoteId,
         type: 'FX_CONVERSION',
@@ -1597,6 +1601,12 @@ export const registerCoreFinanceRoutes = (v1: Router, deps: Deps) => {
         fees: { totalFee: 0, flowCode: null, configId: null },
         status: 'QUOTED',
       };
+      quoteSnapshot.fxSnapshotSignature = signLockedFxSnapshot(
+        quoteSnapshot,
+        quoteId,
+        session.sub,
+        process.env.ORBI_TRANSACTION_QUOTE_SIGNING_SECRET || process.env.JWT_SECRET || process.env.SESSION_SECRET || '',
+      );
       const { error: insertError } = await sb.from('transaction_quotes').insert({
         id: quoteId,
         user_id: session.sub,
@@ -1637,6 +1647,10 @@ export const registerCoreFinanceRoutes = (v1: Router, deps: Deps) => {
           marginBps: result.marginBps,
           riskBufferBps: result.riskBufferBps,
           protectionBps: result.protectionBps,
+          quotedMarginAmount: result.quotedMarginAmount,
+          quotedRiskBufferAmount: result.quotedRiskBufferAmount,
+          spreadCurrency: result.spreadCurrency,
+          revenueStatus: 'QUOTED_ESTIMATE',
         },
       });
       if (reconciliationError) throw reconciliationError;

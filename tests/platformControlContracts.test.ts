@@ -27,10 +27,12 @@ test('admin audit trail and risk alert explorers are exposed as read APIs', asyn
 test('treasury approval and reconciliation run contracts require reason capture', async () => {
   const operations = await source('src/routes/public/operations.ts');
   const server = await source('backend/server.ts');
+  const treasury = await source('backend/enterprise/treasuryService.ts');
 
   assert.match(operations, /TreasuryApprovalSchema/);
   assert.match(operations, /ReconciliationRunSchema/);
   assert.match(operations, /reason:\s*z\.string\(\)\.trim\(\)\.min\(5/);
   assert.match(server, /TREASURY_WITHDRAWAL_APPROVAL_REQUESTED/);
   assert.match(server, /RECONCILIATION_RUN_REQUESTED/);
+  assert.match(treasury, /\.rpc\('approve_treasury_withdrawal_v1'/);
 });

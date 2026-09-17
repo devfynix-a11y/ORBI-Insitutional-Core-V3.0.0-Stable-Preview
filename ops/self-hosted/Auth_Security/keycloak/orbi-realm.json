@@ -6,7 +6,7 @@
   "registrationEmailAsUsername": true,
   "loginWithEmailAllowed": true,
   "duplicateEmailsAllowed": false,
-  "verifyEmail": false,
+  "verifyEmail": true,
   "resetPasswordAllowed": true,
   "rememberMe": false,
   "bruteForceProtected": true,
@@ -58,7 +58,7 @@
         "com.orbi.mobile://oauth/callback",
         "http://127.0.0.1:*"
       ],
-      "webOrigins": ["+"],
+      "webOrigins": [],
       "attributes": {
         "pkce.code.challenge.method": "S256",
         "post.logout.redirect.uris": "com.orbi.mobile:/oauth2redirect##com.orbi.mobile://oauth/callback"
@@ -85,8 +85,8 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "implicitFlowEnabled": false,
-      "redirectUris": ["https://portal.orbifinancial.com/*", "http://localhost:*"],
-      "webOrigins": ["https://portal.orbifinancial.com", "http://localhost:*"],
+      "redirectUris": ["https://portal.orbifinancial.com/*"],
+      "webOrigins": ["https://portal.orbifinancial.com"],
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },

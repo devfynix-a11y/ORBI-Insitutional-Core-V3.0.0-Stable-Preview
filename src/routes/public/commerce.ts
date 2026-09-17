@@ -232,10 +232,17 @@ export const registerCommerceRoutes = (v1: Router, deps: Deps) => {
       return res.status(403).json({ success: false, error: 'ACCESS_DENIED' });
     }
     try {
-      const result = await LogicCore.getMerchantAccountById(req.params.id);
+      const privileged = requireRole(session, ['ADMIN', 'SUPER_ADMIN', 'AUDIT']);
+      const result = await LogicCore.getMerchantAccountById(req.params.id, session.sub, privileged);
+      if (privileged) {
+        await Audit.log('SECURITY', session.sub, 'MERCHANT_ACCOUNT_PRIVILEGED_READ', {
+          merchantId: req.params.id,
+        });
+      }
       res.json({ success: true, data: result });
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      const status = e.message === 'ACCESS_DENIED' ? 403 : e.message === 'MERCHANT_NOT_FOUND' ? 404 : 500;
+      res.status(status).json({ success: false, error: e.message });
     }
   });
 
@@ -245,10 +252,16 @@ export const registerCommerceRoutes = (v1: Router, deps: Deps) => {
       return res.status(403).json({ success: false, error: 'ACCESS_DENIED' });
     }
     try {
-      const result = await LogicCore.updateMerchantSettlement(req.params.id, req.body);
+      const privileged = requireRole(session, ['ADMIN', 'SUPER_ADMIN']);
+      const result = await LogicCore.updateMerchantSettlement(req.params.id, req.body, session.sub, privileged);
+      await Audit.log('SECURITY', session.sub, 'MERCHANT_SETTLEMENT_CONFIGURATION_UPDATED', {
+        merchantId: req.params.id,
+        privileged,
+      });
       res.json({ success: true, data: result });
     } catch (e: any) {
-      res.status(500).json({ success: false, error: e.message });
+      const status = e.message === 'ACCESS_DENIED' ? 403 : e.message === 'MERCHANT_NOT_FOUND' ? 404 : 500;
+      res.status(status).json({ success: false, error: e.message });
     }
   });
 

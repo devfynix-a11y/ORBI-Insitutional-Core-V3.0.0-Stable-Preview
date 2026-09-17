@@ -1,5 +1,6 @@
-import { getSupabase } from '../supabaseClient.js';
-import { UUID } from '../../services/utils.js';
+import crypto from 'node:crypto';
+import { getAdminSupabase, getSupabase } from '../supabaseClient.js';
+import { Messaging } from '../features/MessagingService.js';
 
 export class FinancialCoreEngineService {
     
@@ -77,8 +78,8 @@ export class FinancialCoreEngineService {
     /**
      * Generate API Keys for a Tenant
      */
-    async generateApiKeys(userId: string, tenantId: string, type: 'test' | 'live' = 'live') {
-        const sb = getSupabase();
+    async generateApiKeys(userId: string, tenantId: string, type: 'test' | 'live' = 'test') {
+        const sb = getAdminSupabase() || getSupabase();
         if (!sb) throw new Error("Database not connected");
 
         // Verify user is owner or admin
@@ -93,21 +94,40 @@ export class FinancialCoreEngineService {
             throw new Error("Unauthorized to generate API keys for this tenant");
         }
 
-        const publicKey = `pk_${type}_${UUID.generate().replace(/-/g, '')}`;
-        const secretKey = `sk_${type}_${UUID.generate().replace(/-/g, '')}${UUID.generate().replace(/-/g, '')}`;
+        const environment = type === 'test' ? 'sandbox' : 'live';
+        const serviceCode = `tenant:${tenantId}`;
+        const { data: service } = await sb.from('pay_gateway_developer_services').select('status,environments,scopes_granted').eq('service_code', serviceCode).maybeSingle();
+        if (environment === 'live' && (!service || service.status !== 'active' || !service.environments?.includes('live') || !service.scopes_granted?.includes('wallets:read'))) {
+            throw new Error('LIVE_API_ACCESS_NOT_APPROVED');
+        }
+        if (!service && environment === 'sandbox') {
+            const { error: serviceError } = await sb.from('pay_gateway_developer_services').insert({ service_code: serviceCode, display_name: `Tenant ${tenantId}`, status: 'active', environments: ['sandbox'], scopes_granted: ['wallets:read'], metadata: { provisionedBy: 'tenant_api_key' } });
+            if (serviceError) throw new Error(serviceError.message);
+        }
+        const publicKey = `pk_${type}_${crypto.randomBytes(16).toString('hex')}`;
+        const secretKey = `sk_${type}_${crypto.randomBytes(32).toString('base64url')}`;
+        const secretHash = crypto.createHash('sha256').update(secretKey, 'utf8').digest('hex');
 
         const { data: keys, error } = await sb
             .from('api_keys')
             .insert({
                 tenant_id: tenantId,
                 public_key: publicKey,
-                secret_key: secretKey
+                secret_key: null,
+                secret_hash: secretHash,
+                secret_fingerprint: secretHash.slice(0, 16),
+                environment,
+                audience: 'orbi-core',
+                service_code: serviceCode,
+                scopes: ['wallets:read'],
+                issued_by: userId
             })
             .select()
             .single();
 
         if (error) throw new Error(error.message);
-        return keys;
+        try { await Messaging.dispatch(userId, 'security', 'API credential issued', `A ${environment} API credential was issued for your tenant.`, { push: true, sms: true, email: true, mandatory: true, systemCustomBypass: true, eventCode: 'API_CREDENTIAL_ISSUED', idempotencyKey: `api-credential:${keys.id}:issued:${userId}` }); } catch (notificationError: any) { console.warn(`[FinancialCore] key ${keys.id} issued; notification deferred: ${notificationError.message}`); }
+        return { ...keys, secret_hash: undefined, secretKey };
     }
 
     /**
@@ -131,7 +151,7 @@ export class FinancialCoreEngineService {
 
         const { data, error } = await sb
             .from('api_keys')
-            .select('id, public_key, status, created_at, expires_at')
+            .select('id, public_key, secret_fingerprint, environment, audience, scopes, status, created_at, expires_at, last_used_at, revoked_at')
             .eq('tenant_id', tenantId);
 
         if (error) throw new Error(error.message);
@@ -159,32 +179,30 @@ export class FinancialCoreEngineService {
 
         const { error } = await sb
             .from('api_keys')
-            .update({ status: 'REVOKED' })
+            .update({ status: 'REVOKED', revoked_at: new Date().toISOString() })
             .eq('id', apiKeyId)
             .eq('tenant_id', tenantId);
 
         if (error) throw new Error(error.message);
+        try { await Messaging.dispatch(userId, 'security', 'API credential revoked', 'An API credential for your tenant was revoked.', { push: true, sms: true, email: true, mandatory: true, systemCustomBypass: true, eventCode: 'API_CREDENTIAL_REVOKED', idempotencyKey: `api-credential:${apiKeyId}:revoked:${userId}` }); } catch (notificationError: any) { console.warn(`[FinancialCore] key ${apiKeyId} revoked; notification deferred: ${notificationError.message}`); }
         return { success: true };
     }
 
     /**
      * Validate an API Key (Middleware usage)
      */
-    async validateApiKey(secretKey: string) {
-        const sb = getSupabase();
+    async validateApiKey(secretKey: string, context: { environment: string; audience: string; requiredScopes: string[]; subjectUserId?: string; purpose?: string }) {
+        const sb = getAdminSupabase() || getSupabase();
         if (!sb) throw new Error("Database not connected");
 
-        const { data, error } = await sb
-            .from('api_keys')
-            .select('tenant_id, status')
-            .eq('secret_key', secretKey)
-            .single();
-
-        if (error || !data || data.status !== 'ACTIVE') {
-            return null;
-        }
-
-        return data.tenant_id;
+        const secretHash = crypto.createHash('sha256').update(secretKey, 'utf8').digest('hex');
+        const { data, error } = await sb.rpc('authorize_external_api_request_v1', {
+            p_secret_hash: secretHash, p_environment: context.environment,
+            p_audience: context.audience, p_required_scopes: context.requiredScopes,
+            p_subject_user_id: context.subjectUserId || null, p_purpose: context.purpose || null,
+        });
+        if (error || !data) return null;
+        return data as { keyId: string; tenantId: string; serviceCode?: string; environment: string; audience: string; scopes: string[]; subjectUserId?: string };
     }
 
     /**

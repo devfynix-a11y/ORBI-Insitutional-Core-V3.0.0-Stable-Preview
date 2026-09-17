@@ -45,6 +45,10 @@ class OrbiTalkGatewayService {
         return raw.replace(/\/+$/, '').replace(/\/api$/, '');
     }
 
+    private externalDeliveryDisabled(): boolean {
+        return process.env.ORBI_DISABLE_EXTERNAL_DELIVERIES === 'true';
+    }
+
     private normalizePhone(phone: string): string {
         try {
             const parsed = parsePhoneNumber(phone, 'TZ');
@@ -229,6 +233,10 @@ class OrbiTalkGatewayService {
     }
 
     async sendSms(recipient: string, body: string, language: string = 'en', ownerUid?: string, ownerEmail?: string, requestId?: string): Promise<boolean> {
+        if (this.externalDeliveryDisabled()) {
+            orbiTalkGatewayLogger.info('orbi_talk_gateway.external_delivery_disabled', { channel: 'sms' });
+            return false;
+        }
         if (!this.apiKey || !this.baseUrl) {
             orbiTalkGatewayLogger.error('orbi_talk_gateway.sms_missing_configuration', { channel: 'sms' });
             return false;
@@ -271,6 +279,10 @@ class OrbiTalkGatewayService {
     }
 
     async sendEmail(recipient: string, subject: string, body: string, html?: string, language: string = 'en', ownerUid?: string, ownerEmail?: string, requestId?: string, brand?: NotificationBrandContext | NotificationBrand): Promise<boolean> {
+        if (this.externalDeliveryDisabled()) {
+            orbiTalkGatewayLogger.info('orbi_talk_gateway.external_delivery_disabled', { channel: 'email' });
+            return false;
+        }
         if (!this.apiKey || !this.baseUrl) {
             orbiTalkGatewayLogger.error('orbi_talk_gateway.email_missing_configuration', { channel: 'email', recipient });
             return false;
@@ -380,6 +392,10 @@ class OrbiTalkGatewayService {
     }
 
     async sendPush(fcmToken: string, title: string, body: string, data: Record<string, any> = {}, language: string = 'en', ownerUid?: string, ownerEmail?: string, requestId?: string): Promise<boolean> {
+        if (this.externalDeliveryDisabled()) {
+            orbiTalkGatewayLogger.info('orbi_talk_gateway.external_delivery_disabled', { channel: 'push' });
+            return false;
+        }
         if (!this.apiKey || !this.baseUrl) {
             orbiTalkGatewayLogger.error('orbi_talk_gateway.push_missing_configuration', { channel: 'push' });
             return false;
@@ -438,6 +454,11 @@ class OrbiTalkGatewayService {
         options: { channel?: string; language?: string; messageType?: 'transactional' | 'promotional'; fcmToken?: string; ownerUid?: string; ownerEmail?: string; requestId?: string; brand?: NotificationBrandContext | NotificationBrand } = {}
     ): Promise<boolean> {
         const { channel = 'sms', language = 'en', messageType = 'transactional', fcmToken, ownerUid, ownerEmail, requestId, brand } = options;
+
+        if (this.externalDeliveryDisabled()) {
+            orbiTalkGatewayLogger.info('orbi_talk_gateway.external_delivery_disabled', { channel, template_name: templateName });
+            return false;
+        }
 
         if (!this.apiKey || !this.baseUrl) {
             orbiTalkGatewayLogger.error('orbi_talk_gateway.template_missing_configuration', { channel, recipient, template_name: templateName });

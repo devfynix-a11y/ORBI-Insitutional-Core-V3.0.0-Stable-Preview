@@ -84,12 +84,17 @@ const notifyBudgetMembers = async (
   const userIds: string[] = Array.from(
     new Set<string>((members || []).map((member: any) => String(member.user_id || '')).filter(Boolean)),
   ).filter((userId) => !excluded.has(userId));
+  const eventCode = variables.eventCode || 'SHARED_BUDGET_UPDATED';
+  const eventId = String(variables.eventId || variables.transactionId || variables.approvalId || variables.inviteId || variables.memberId || '').trim();
 
   await Promise.all(userIds.map((userId) => Messaging.dispatch(userId, 'info', subject, body, {
     push: true,
     sms: true,
     email: true,
-    eventCode: variables.eventCode || 'SHARED_BUDGET_UPDATED',
+    systemCustomBypass: true,
+    mandatory: true,
+    eventCode,
+    ...(eventId ? { idempotencyKey: `${eventCode}:${eventId}` } : {}),
     variables: {
       ...variables,
       recipient_user_id: userId,
@@ -123,6 +128,7 @@ const notifySharedBudgetSpend = async (
   const amountLabel = formatBudgetAmount(amount, budget.currency);
   const budgetName = String(budget.name || 'Mezani');
   const transactionId = data?.transaction?.internalId || data?.transaction?.id || data?.budget_transaction?.transaction_id || null;
+  const eventId = String(transactionId || data?.approval?.id || data?.budget_transaction?.id || '').trim();
   const eventCode = options.requiresApproval
     ? 'SHARED_BUDGET_SPEND_APPROVAL_REQUESTED'
     : isWithdrawal
@@ -143,7 +149,10 @@ const notifySharedBudgetSpend = async (
     push: true,
     sms: true,
     email: true,
+    systemCustomBypass: true,
+    mandatory: true,
     eventCode,
+    ...(eventId ? { idempotencyKey: `${eventCode}:${eventId}` } : {}),
     variables: {
       eventCode,
       budgetId: budget.id,
@@ -151,6 +160,7 @@ const notifySharedBudgetSpend = async (
       amount: amountLabel,
       currency: String(budget.currency || 'TZS').toUpperCase(),
       transactionId,
+      eventId,
       spendType: normalizedType,
       approvedByUserId: options.approvedByUserId || null,
     },
@@ -358,40 +368,31 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
     }
   });
 
-  v1.post('/wealth/shared-budgets', authenticate as any, async (req, res) => {
+  v1.post('/wealth/shared-budgets', authenticate as any, requireIdempotencyKey, async (req, res) => {
     const session = (req as any).session;
     try {
       const payload = SharedBudgetCreateSchema.parse(req.body);
       const sb = getAdminSupabase() || getSupabase();
       if (!sb) return res.status(503).json({ success: false, error: 'DB_OFFLINE' });
-      const { data, error } = await sb
-        .from('shared_budgets')
-        .insert({
-          owner_user_id: session.sub,
-          name: payload.name,
-          purpose: payload.purpose,
-          currency: payload.currency?.toUpperCase() || 'TZS',
-          budget_limit: payload.budget_limit,
-          funded_amount: 0,
-          spent_amount: 0,
+      const idempotencyKey = String(resolveIdempotencyHeader(req)).trim();
+      const { data: creation, error } = await sb.rpc('create_shared_budget_v1', {
+        p_actor_id: session.sub, p_name: payload.name, p_purpose: payload.purpose || null,
+        p_currency: payload.currency?.toUpperCase() || 'TZS', p_budget_limit: payload.budget_limit,
+        p_period_type: payload.period_type || 'MONTHLY', p_approval_mode: payload.approval_mode || 'AUTO',
+        p_idempotency_key: idempotencyKey, p_metadata: { created_from: 'mobile_app' },
+      });
+      if (error) return res.status(400).json({ success: false, error: error.message });
+      let data = creation?.budget;
+      if (!creation?.idempotent && (payload.auto_allocate_enabled || payload.auto_allocate_mode || payload.auto_allocate_amount || payload.auto_allocate_threshold)) {
+        const { data: configured, error: configureError } = await sb.from('shared_budgets').update({
           auto_allocate_enabled: payload.auto_allocate_enabled || false,
           auto_allocate_mode: payload.auto_allocate_mode || (payload.auto_allocate_enabled ? 'FIXED' : 'MANUAL'),
           auto_allocate_amount: payload.auto_allocate_amount || 0,
           auto_allocate_threshold: payload.auto_allocate_threshold || 0,
-          period_type: payload.period_type || 'MONTHLY',
-          approval_mode: payload.approval_mode || 'AUTO',
-          status: 'ACTIVE',
-          metadata: { created_from: 'mobile_app' },
-        })
-        .select('*')
-        .single();
-      if (error) return res.status(400).json({ success: false, error: error.message });
-      await sb.from('shared_budget_members').insert({
-        budget_id: data.id,
-        user_id: session.sub,
-        role: 'OWNER',
-        spent_amount: 0,
-      });
+        }).eq('id', data.id).select('*').single();
+        if (configureError) return res.status(400).json({ success: false, error: configureError.message });
+        data = configured;
+      }
       if (payload.auto_allocate_enabled) {
         const autoMode = payload.auto_allocate_mode || 'FIXED';
         await sb.from('allocation_rules').insert({
@@ -919,9 +920,12 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
         `${session.user?.user_metadata?.full_name || 'A member'} invited you to join "${budget.name}" as ${String(payload.role || 'SPENDER').toLowerCase()}.`,
         {
           push: true,
-          sms: false,
+          sms: true,
           email: true,
+          mandatory: true,
+          systemCustomBypass: true,
           eventCode: 'SHARED_BUDGET_INVITATION',
+          idempotencyKey: `SHARED_BUDGET_INVITATION:${data.id}`,
           variables: {
             budget_name: budget.name,
             role: payload.role || 'SPENDER',
@@ -936,93 +940,19 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
     }
   });
 
-  v1.post('/wealth/shared-budget-invitations/:id/respond', authenticate as any, async (req, res) => {
+  v1.post('/wealth/shared-budget-invitations/:id/respond', authenticate as any, requireIdempotencyKey, async (req, res) => {
     const session = (req as any).session;
     try {
       const payload = SharedBudgetInviteResponseSchema.parse(req.body);
       const sb = getAdminSupabase() || getSupabase();
       if (!sb) return res.status(503).json({ success: false, error: 'DB_OFFLINE' });
 
-      const { data: inviteRaw, error: inviteError } = await sb
-        .from('shared_budget_invitations')
-        .select('*')
-        .eq('id', req.params.id)
-        .maybeSingle();
-      if (inviteError) return res.status(400).json({ success: false, error: inviteError.message });
-      if (!inviteRaw) return res.status(404).json({ success: false, error: 'SHARED_BUDGET_INVITE_NOT_FOUND' });
-      const invite = await expireSharedBudgetInvitationIfNeeded(sb, inviteRaw);
-
-      if (String(invite.invitee_user_id || '') !== String(session.sub)) {
-        return res.status(403).json({ success: false, error: 'SHARED_BUDGET_INVITE_ACCESS_DENIED' });
-      }
-      if (String(invite.status || '').toUpperCase() !== 'PENDING') {
-        return res.status(400).json({ success: false, error: 'SHARED_BUDGET_INVITE_NOT_PENDING' });
-      }
-
-      if (payload.action === 'REJECT') {
-        const { data, error } = await sb
-          .from('shared_budget_invitations')
-          .update({
-            status: 'REJECTED',
-            responded_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', invite.id)
-          .select('*')
-          .single();
-        if (error) return res.status(400).json({ success: false, error: error.message });
-        return res.json({ success: true, data: { invitation: data } });
-      }
-
-      const { data: existingMember, error: existingMemberError } = await sb
-        .from('shared_budget_members')
-        .select('id,status')
-        .eq('budget_id', invite.budget_id)
-        .eq('user_id', session.sub)
-        .maybeSingle();
-      if (existingMemberError) return res.status(400).json({ success: false, error: existingMemberError.message });
-      if (String(existingMember?.status || '').toUpperCase() === 'ACTIVE') {
-        return res.status(400).json({ success: false, error: 'SHARED_BUDGET_MEMBER_ALREADY_EXISTS' });
-      }
-
-      const memberPayload = {
-        role: invite.role || 'SPENDER',
-        status: 'ACTIVE',
-        member_limit: invite.member_limit || null,
-        metadata: {
-          joined_via_invitation: invite.id,
-          invited_by: invite.inviter_user_id,
-        },
-      };
-      const memberQuery = existingMember?.id
-        ? sb
-            .from('shared_budget_members')
-            .update(memberPayload)
-            .eq('id', existingMember.id)
-        : sb
-            .from('shared_budget_members')
-            .insert({
-              budget_id: invite.budget_id,
-              user_id: session.sub,
-              spent_amount: 0,
-              ...memberPayload,
-            });
-      const { data: member, error: memberError } = await memberQuery.select('*').single();
-      if (memberError) return res.status(400).json({ success: false, error: memberError.message });
-
-      const { data: updatedInvite, error: updateInviteError } = await sb
-        .from('shared_budget_invitations')
-        .update({
-          status: 'ACCEPTED',
-          responded_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', invite.id)
-        .select('*')
-        .single();
-      if (updateInviteError) return res.status(400).json({ success: false, error: updateInviteError.message });
-
-      res.json({ success: true, data: { invitation: updatedInvite, member } });
+      const { data, error } = await sb.rpc('respond_shared_budget_invitation_v1', {
+        p_actor_id: session.sub, p_invitation_id: req.params.id, p_action: payload.action,
+        p_idempotency_key: String(resolveIdempotencyHeader(req)).trim(),
+      });
+      if (error) return res.status(400).json({ success: false, error: error.message });
+      res.json({ success: true, data });
     } catch (e: any) {
       const status = e.message === 'SHARED_BUDGET_INVITE_ACCESS_DENIED' ? 403 : 400;
       res.status(status).json({ success: false, error: e.message });
@@ -1074,31 +1004,16 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
         .maybeSingle();
       if (approvalError) return res.status(400).json({ success: false, error: approvalError.message });
       if (!approval) return res.status(404).json({ success: false, error: 'SHARED_BUDGET_APPROVAL_NOT_FOUND' });
-      if (String(approval.status || '').toUpperCase() !== 'PENDING') {
-        return res.status(400).json({ success: false, error: 'SHARED_BUDGET_APPROVAL_NOT_PENDING' });
-      }
-
       const { budget, membership } = await resolveSharedBudgetMembership(sb, approval.shared_budget_id, session.sub);
       if (!canReviewSharedBudgetSpend(String(membership.role || ''))) {
         return res.status(403).json({ success: false, error: 'SHARED_BUDGET_ACCESS_DENIED' });
       }
 
-      if (payload.action === 'REJECT') {
-        const { data, error } = await sb
-          .from('shared_budget_approvals')
-          .update({
-            status: 'REJECTED',
-            reviewer_user_id: session.sub,
-            responded_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            note: payload.note ?? approval.note ?? null,
-          })
-          .eq('id', approval.id)
-          .select('*')
-          .single();
-        if (error) return res.status(400).json({ success: false, error: error.message });
-        return res.json({ success: true, data: { approval: data } });
-      }
+      const { data: claim, error: claimError } = await sb.rpc('claim_shared_budget_approval_v1', {
+        p_reviewer_id: session.sub, p_approval_id: approval.id, p_action: payload.action,
+      });
+      if (claimError) return res.status(400).json({ success: false, error: claimError.message });
+      if (payload.action === 'REJECT') return res.json({ success: true, data: claim });
 
       const requesterMembershipResult = await resolveSharedBudgetMembership(
         sb,
@@ -1111,6 +1026,8 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
         : {};
 
       const spendPayload = {
+        idempotencyKey: String(approval.id),
+        idempotency_key: String(approval.id),
         source_wallet_id: approvalMetadata.source_wallet_id || null,
         amount: wealthNumber(approval.amount),
         currency: approval.currency || budget.currency || 'TZS',
@@ -1127,17 +1044,23 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
         },
       };
 
-      const spendData = await executeSharedBudgetSpend(sb, {
-        budget,
-        membership: requesterMembershipResult.membership,
-        actorUserId: String(approval.requester_user_id),
-        actorUser: {
-          ...(session.user || {}),
-          id: String(approval.requester_user_id),
-        },
-        payload: spendPayload,
-        approvalId: approval.id,
-      });
+      let spendData: any;
+      try {
+        spendData = await executeSharedBudgetSpend(sb, {
+          budget,
+          membership: requesterMembershipResult.membership,
+          actorUserId: String(approval.requester_user_id),
+          actorUser: { ...(session.user || {}), id: String(approval.requester_user_id) },
+          payload: spendPayload,
+          approvalId: approval.id,
+        });
+      } catch (spendError: any) {
+        await sb.rpc('finish_shared_budget_approval_v1', {
+          p_reviewer_id: session.sub, p_approval_id: approval.id, p_status: 'FAILED',
+          p_transaction_id: null, p_error: String(spendError?.message || spendError),
+        });
+        throw spendError;
+      }
       await notifySharedBudgetSpend(
         sb,
         budget,
@@ -1149,22 +1072,10 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
       );
 
       const transactionId = (spendData as any)?.transaction?.internalId || (spendData as any)?.transaction?.id || null;
-      const { data: updatedApproval, error: approvalUpdateError } = await sb
-        .from('shared_budget_approvals')
-        .update({
-          status: 'APPROVED',
-          reviewer_user_id: session.sub,
-          responded_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-          metadata: {
-            ...approvalMetadata,
-            approved_transaction_id: transactionId,
-            approval_response_note: payload.note || null,
-          },
-        })
-        .eq('id', approval.id)
-        .select('*')
-        .single();
+      const { data: updatedApproval, error: approvalUpdateError } = await sb.rpc('finish_shared_budget_approval_v1', {
+        p_reviewer_id: session.sub, p_approval_id: approval.id, p_status: 'APPROVED',
+        p_transaction_id: transactionId, p_error: null,
+      });
       if (approvalUpdateError) return res.status(400).json({ success: false, error: approvalUpdateError.message });
 
       res.json({ success: true, data: { approval: updatedApproval, ...spendData } });
@@ -1337,19 +1248,7 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
         },
       };
       if (String(budget.approval_mode || 'AUTO').toUpperCase() === 'REVIEW') {
-        const { data, error } = await sb
-          .from('shared_budget_approvals')
-          .insert({
-            shared_budget_id: budget.id,
-            requester_user_id: session.sub,
-            amount: payload.amount,
-            currency: (payload.currency || budget.currency || 'TZS').toUpperCase(),
-            provider: payload.provider || null,
-            bill_category: payload.bill_category || null,
-            reference: payload.reference || null,
-            note: payload.description || null,
-            status: 'PENDING',
-            metadata: {
+        const approvalMetadata = {
               ...(normalizedPayload.metadata || {}),
               source_wallet_id: sourceRecord.id,
               type: payload.type || 'EXTERNAL_PAYMENT',
@@ -1366,11 +1265,16 @@ export const registerSharedBudgetRoutes = (v1: Router, deps: Deps) => {
               bill_category: payload.bill_category || null,
               bill_reference: payload.reference || null,
               preview_required: true,
-            },
-          })
-          .select('*')
-          .single();
+        };
+        const { data: approvalResult, error } = await sb.rpc('request_shared_budget_approval_v1', {
+          p_actor_id: session.sub, p_budget_id: budget.id, p_amount: payload.amount,
+          p_currency: (payload.currency || budget.currency || 'TZS').toUpperCase(),
+          p_provider: payload.provider || null, p_bill_category: payload.bill_category || null,
+          p_reference: payload.reference || null, p_note: payload.description || null,
+          p_idempotency_key: payload.idempotencyKey, p_metadata: approvalMetadata,
+        });
         if (error) return res.status(400).json({ success: false, error: error.message });
+        const data = approvalResult?.approval;
         await notifySharedBudgetSpend(sb, budget, session.sub, { approval: data }, payload.amount, payload.type, {
           requiresApproval: true,
         });

@@ -6,6 +6,9 @@ Scope: ORBI Core backend, ledger authority, PaySafe, shared finance, gateway
 handoff, security controls, notifications, reconciliation, and deployment
 readiness.
 
+For merchant, agent, organization, developer, and third-party launch readiness,
+use [ORBI Ecosystem Readiness And Remaining Slices](./ECOSYSTEM_READINESS_AND_REMAINING_SLICES.md).
+
 ## Executive Verdict
 
 ORBI Core is a strong working financial-core foundation. It should not yet be
@@ -74,7 +77,7 @@ and Valkey, then overlays `.env.test.local` for disposable fixture targeting.
 | Ledger authority | Strong, Do Not Touch | SQL-authoritative posting, idempotency, append-only markers, locked-wallet and insufficient-funds errors are covered. Any change requires review. |
 | Transaction history / movement classification | Do Not Touch | Current architecture separates ledger truth from UI/report wording. Do not change ledger writes for display fixes. |
 | Reconciliation | Needs operational evidence | Reconciliation docs and tests exist, but production readiness needs scheduled runs, alert evidence, and restore-drill reconciliation. |
-| Notifications / messaging | Needs worker/outbox hardening | Notifications are correctly treated as side effects. Durable shared-finance notification retry/outbox remains a key follow-up. |
+| Notifications / messaging | Partially hardened | Organization governance events now use a durable per-recipient claim ledger, stable provider request IDs, bilingual copy, mandatory Push/SMS/email routing when recipient endpoints exist, duplicate suppression, and stale/failed reclaim. A scheduled retry worker and delivery dashboard remain required across every financial domain. |
 | WebSocket / realtime | Needs operational monitoring | Socket registry warnings in local test are expected without Supabase/env. Production needs heartbeat, reconnect, and delivery dashboards. |
 | Security/auth | Strong, Needs env verification | Authorization, WAF, internal worker HMAC/mTLS, KMS lifecycle, and route guards are tested. Production requires real secrets, KMS readiness, token revocation coverage, and audit-chain checks. |
 | Backup/restore | Not complete | Readiness checklist still requires automated restore test with production-like data. |

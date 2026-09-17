@@ -51,6 +51,8 @@ The Banking Engine natively supports cross-currency transactions through the int
 - **Live Rates**: Exchange rates are fetched in real-time from trusted global APIs (cached for 1 hour).
 - **Normalized Compliance**: All transaction amounts are converted to USD in real-time before being evaluated by the **Risk & Compliance Engine (AML)** to ensure consistent global rule enforcement (e.g., $10,000 reporting thresholds).
 - **Spread-Based Pricing**: ORBI does not apply a separate FX fee. Customer pricing is produced from the provider market rate plus the configured spread/risk policy.
+- **Locked Settlement**: A signed, unexpired quote snapshot is settled at its stored customer rate; a conversion is rejected if its amount, wallet currencies, rate, spread, or expiry no longer match the quote.
+- **Segregated Accounting**: FX clearing, spread revenue, and risk reserve accounts are separated by currency. The SQL ledger validates wallet denomination and balances each currency independently.
 
 ### 3.2 P2P Transfer (Strict Escrow Flow)
 The engine enforces a **Strict Escrow Flow** for all internal and peer transfers. This ensures that funds are never moved directly between operating vaults, mitigating risks from network failures or security challenges.

@@ -29,6 +29,16 @@ const EDGE_FIXTURE_ENV = [
   'ORBI_DB_TEST_WITHDRAWAL_PROVIDER_ID',
 ];
 
+const TREASURY_FIXTURE_ENV = [
+  'ORBI_DB_TEST_TREASURY_MAKER_ID',
+  'ORBI_DB_TEST_TREASURY_ADMIN_1_ID',
+  'ORBI_DB_TEST_TREASURY_ADMIN_2_ID',
+  'ORBI_DB_TEST_TREASURY_CROSS_ORG_ADMIN_ID',
+  'ORBI_DB_TEST_TREASURY_ORG_ID',
+  'ORBI_DB_TEST_TREASURY_GOAL_ID',
+  'ORBI_DB_TEST_TREASURY_DESTINATION_WALLET_ID',
+];
+
 const TEST_AMOUNT = Number(process.env.ORBI_DB_TEST_AMOUNT || '0.01');
 const INSUFFICIENT_AMOUNT = Number(process.env.ORBI_DB_TEST_INSUFFICIENT_AMOUNT || '999999');
 const BUDGET_TRIGGER_AMOUNT = Number(process.env.ORBI_DB_TEST_BUDGET_TRIGGER_AMOUNT || '0');
@@ -1206,6 +1216,347 @@ dbIntegrationTest(
     assert.ok(Number(privilegedRepairAuditCount || 0) >= 2, 'Expected at least two privileged repair audit rows');
   },
   { requireWrites: true, requiredEnv: EDGE_FIXTURE_ENV },
+);
+
+dbIntegrationTest(
+  'disposable treasury fixture serializes quorum and applies its ledger debit once',
+  async (t, client) => {
+    assert.equal(process.env.ORBI_DB_TEST_DISPOSABLE, 'true');
+    const makerId = requireEnv('ORBI_DB_TEST_TREASURY_MAKER_ID');
+    const admin1Id = requireEnv('ORBI_DB_TEST_TREASURY_ADMIN_1_ID');
+    const admin2Id = requireEnv('ORBI_DB_TEST_TREASURY_ADMIN_2_ID');
+    const crossOrgAdminId = requireEnv('ORBI_DB_TEST_TREASURY_CROSS_ORG_ADMIN_ID');
+    const organizationId = requireEnv('ORBI_DB_TEST_TREASURY_ORG_ID');
+    const goalId = requireEnv('ORBI_DB_TEST_TREASURY_GOAL_ID');
+    const destinationWalletId = requireEnv('ORBI_DB_TEST_TREASURY_DESTINATION_WALLET_ID');
+    const txId = randomUUID();
+    const amount = TEST_AMOUNT;
+
+    const [{ data: goal, error: goalError }, { data: destination, error: destinationError }] = await Promise.all([
+      client.from('goals').select('id, organization_id, is_corporate, current').eq('id', goalId).single(),
+      client.from('wallets').select('id, balance').eq('id', destinationWalletId).single(),
+    ]);
+    assert.ifError(goalError);
+    assert.ifError(destinationError);
+    assert.equal(String(goal.organization_id), organizationId);
+    assert.equal(goal.is_corporate, true);
+    const originalGoalBalance = Number(goal.current);
+    const originalDestinationBalance = Number(destination.balance);
+    assert.ok(originalGoalBalance >= amount, 'Treasury goal fixture needs sufficient balance');
+
+    const policyArgs = {
+      p_organization_id: organizationId,
+      p_currency: 'TZS',
+      p_name: 'Certification treasury policy',
+      p_description: 'Disposable concurrency policy',
+      p_min_approvals: 2,
+      p_max_amount_per_tx: 100,
+      p_daily_limit: 1000,
+      p_change_reason: 'Initial certification policy',
+    };
+    const crossPolicy = await client.rpc('upsert_treasury_policy_v1', { ...policyArgs, p_actor_id: crossOrgAdminId });
+    assert.match(String(crossPolicy.error?.message || ''), /TREASURY_POLICY_ADMIN_REQUIRED/);
+    const impossiblePolicy = await client.rpc('upsert_treasury_policy_v1', {
+      ...policyArgs, p_actor_id: admin1Id, p_min_approvals: 3,
+    });
+    assert.match(String(impossiblePolicy.error?.message || ''), /TREASURY_POLICY_QUORUM_UNAVAILABLE/);
+
+    const crossOrgApproverChange = await client.rpc('request_treasury_approver_change_v1', {
+      p_actor_id: crossOrgAdminId, p_organization_id: organizationId, p_target_user_id: makerId,
+      p_action: 'ADD', p_reason: 'Cross organization request must fail',
+    });
+    assert.match(String(crossOrgApproverChange.error?.message || ''), /TREASURY_APPROVER_ADMIN_REQUIRED/);
+    const { data: addApproverRequestId, error: addApproverRequestError } = await client.rpc(
+      'request_treasury_approver_change_v1',
+      { p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: makerId,
+        p_action: 'ADD', p_reason: 'Certification needs a third approver' },
+    );
+    assert.ifError(addApproverRequestError);
+    const selfReview = await client.rpc('respond_treasury_approver_change_v1', {
+      p_reviewer_id: admin1Id, p_request_id: addApproverRequestId,
+      p_decision: 'APPROVE', p_reason: 'Requester cannot review this change',
+    });
+    assert.match(String(selfReview.error?.message || ''), /TREASURY_APPROVER_REVIEWER_REQUIRED/);
+    const addApprover = await client.rpc('respond_treasury_approver_change_v1', {
+      p_reviewer_id: admin2Id, p_request_id: addApproverRequestId,
+      p_decision: 'APPROVE', p_reason: 'Independent certification approval',
+    });
+    assert.ifError(addApprover.error);
+
+    const createdPolicy = await client.rpc('upsert_treasury_policy_v1', {
+      ...policyArgs, p_actor_id: admin1Id, p_min_approvals: 3,
+    });
+    assert.ifError(createdPolicy.error);
+    assert.equal(Number(createdPolicy.data?.version), 1);
+    const { data: removeApproverRequestId, error: removeApproverRequestError } = await client.rpc(
+      'request_treasury_approver_change_v1',
+      { p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: makerId,
+        p_action: 'REMOVE', p_reason: 'Exercise protected removal workflow' },
+    );
+    assert.ifError(removeApproverRequestError);
+    const quorumBreakingRemoval = await client.rpc('respond_treasury_approver_change_v1', {
+      p_reviewer_id: admin2Id, p_request_id: removeApproverRequestId,
+      p_decision: 'APPROVE', p_reason: 'Attempt removal below active policy quorum',
+    });
+    assert.match(String(quorumBreakingRemoval.error?.message || ''), /TREASURY_APPROVER_REMOVAL_BREAKS_QUORUM/);
+    const updatedPolicy = await client.rpc('upsert_treasury_policy_v1', {
+      ...policyArgs, p_actor_id: admin1Id, p_min_approvals: 2,
+      p_change_reason: 'Second certification version', p_daily_limit: 1200,
+    });
+    assert.ifError(updatedPolicy.error);
+    assert.equal(Number(updatedPolicy.data?.version), 2);
+
+    t.after(async () => {
+      await client.from('financial_ledger').delete().eq('transaction_id', txId);
+      await client.from('transactions').delete().eq('id', txId);
+      await client.from('goals').update({ current: originalGoalBalance }).eq('id', goalId);
+      await client.from('wallets').update({ balance: originalDestinationBalance }).eq('id', destinationWalletId);
+      await client.from('treasury_approver_change_requests').delete().eq('organization_id', organizationId);
+      await client.from('treasury_approvers').delete().eq('organization_id', organizationId).eq('user_id', makerId);
+      await client.from('treasury_policy_versions').delete().eq('policy_id', createdPolicy.data.policy_id);
+      await client.from('treasury_policies').delete().eq('id', createdPolicy.data.policy_id);
+    });
+
+    const [encryptedAmount, encryptedDescription] = await Promise.all([
+      DataProtection.encryptAmount(amount),
+      DataProtection.encryptDescription('Disposable treasury concurrency certification'),
+    ]);
+    const { data: requested, error: requestError } = await client.rpc('request_treasury_withdrawal_v1', {
+      p_transaction_id: txId,
+      p_user_id: makerId,
+      p_goal_id: goalId,
+      p_destination_wallet_id: destinationWalletId,
+      p_amount: amount,
+      p_encrypted_amount: encryptedAmount,
+      p_encrypted_description: encryptedDescription,
+      p_reason: 'Disposable treasury concurrency certification',
+      p_reference_id: `ITEST-TREASURY-${txId.slice(0, 8)}`,
+    });
+    assert.ifError(requestError);
+    assert.equal(Number(requested.approvals_required), 2);
+
+    const crossOrg = await client.rpc('approve_treasury_withdrawal_v1', {
+      p_admin_id: crossOrgAdminId,
+      p_transaction_id: txId,
+    });
+    assert.ok(crossOrg.error);
+    assert.match(String(crossOrg.error?.message || ''), /TREASURY_APPROVER_ACCESS_DENIED/);
+
+    const makerApproval = await client.rpc('approve_treasury_withdrawal_v1', {
+      p_admin_id: makerId,
+      p_transaction_id: txId,
+    });
+    assert.ok(makerApproval.error);
+    assert.match(String(makerApproval.error?.message || ''), /TREASURY_MAKER_CHECKER_VIOLATION/);
+
+    const approvals = await Promise.all([
+      client.rpc('approve_treasury_withdrawal_v1', { p_admin_id: admin1Id, p_transaction_id: txId }),
+      client.rpc('approve_treasury_withdrawal_v1', { p_admin_id: admin2Id, p_transaction_id: txId }),
+    ]);
+    approvals.forEach((result) => assert.ifError(result.error));
+    assert.equal(approvals.filter((result) => result.data?.should_execute === true).length, 1);
+    assert.equal(approvals.filter((result) => result.data?.fully_approved === false).length, 1);
+
+    const legs = [
+      { wallet_id: goalId, entry_type: 'DEBIT', amount: encryptedAmount, amount_plain: amount, description: 'Treasury debit' },
+      { wallet_id: destinationWalletId, entry_type: 'CREDIT', amount: encryptedAmount, amount_plain: amount, description: 'Treasury credit' },
+    ];
+    const appends = await Promise.all([
+      client.rpc('append_ledger_entries_v1', {
+        p_tx_id: txId, p_legs: legs, p_append_key: `treasury-withdrawal:${txId}`, p_append_phase: 'TREASURY_WITHDRAWAL_EXECUTION',
+      }),
+      client.rpc('append_ledger_entries_v1', {
+        p_tx_id: txId, p_legs: legs, p_append_key: `treasury-withdrawal:${txId}`, p_append_phase: 'TREASURY_WITHDRAWAL_EXECUTION',
+      }),
+    ]);
+    assert.equal(appends.filter((result) => !result.error).length, 1);
+    assert.equal(appends.filter((result) => /APPEND_ALREADY_APPLIED/.test(String(result.error?.message || ''))).length, 1);
+
+    const [{ data: updatedGoal }, { data: updatedDestination }, { count: legCount }] = await Promise.all([
+      client.from('goals').select('current').eq('id', goalId).single(),
+      client.from('wallets').select('balance').eq('id', destinationWalletId).single(),
+      client.from('financial_ledger').select('*', { count: 'exact', head: true }).eq('transaction_id', txId),
+    ]);
+    assert.equal(Number(updatedGoal.current), originalGoalBalance - amount);
+    assert.equal(Number(updatedDestination.balance), originalDestinationBalance + amount);
+    assert.equal(Number(legCount), 2);
+  },
+  { requireWrites: true, requiredEnv: TREASURY_FIXTURE_ENV },
+);
+
+dbIntegrationTest(
+  'organization invitation requires consent, expires, and accepts once under lock',
+  async (t, client) => {
+    assert.equal(process.env.ORBI_DB_TEST_DISPOSABLE, 'true');
+    const admin1Id = requireEnv('ORBI_DB_TEST_TREASURY_ADMIN_1_ID');
+    const admin2Id = requireEnv('ORBI_DB_TEST_TREASURY_ADMIN_2_ID');
+    const crossOrgAdminId = requireEnv('ORBI_DB_TEST_TREASURY_CROSS_ORG_ADMIN_ID');
+    const organizationId = requireEnv('ORBI_DB_TEST_TREASURY_ORG_ID');
+    const inviteeId = '00000000-0000-0000-0000-000000000022';
+    t.after(async () => {
+      await client.from('organization_member_change_requests').delete().eq('target_user_id', inviteeId);
+      await client.from('organization_invitations').delete().eq('target_user_id', inviteeId);
+      await client.from('treasury_approvers').delete().eq('user_id', inviteeId);
+      await client.from('users').update({ organization_id: null, org_role: null }).eq('id', inviteeId);
+    });
+
+    const crossOrg = await client.rpc('request_organization_invitation_v1', {
+      p_actor_id: crossOrgAdminId, p_organization_id: organizationId, p_target_user_id: inviteeId,
+      p_role: 'MEMBER', p_reason: 'Cross organization invitation probe',
+    });
+    assert.match(String(crossOrg.error?.message || ''), /ORGANIZATION_INVITATION_ADMIN_REQUIRED/);
+    const privileged = await client.rpc('request_organization_invitation_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: inviteeId,
+      p_role: 'ADMIN', p_reason: 'Privileged invitation probe',
+    });
+    assert.match(String(privileged.error?.message || ''), /ORGANIZATION_INVITATION_PRIVILEGED_ROLE_DENIED/);
+
+    const { data: first, error: firstError } = await client.rpc('request_organization_invitation_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: inviteeId,
+      p_role: 'ACCOUNTANT', p_reason: 'Disposable invitation expiry proof',
+    });
+    assert.ifError(firstError);
+    const wrongTarget = await client.rpc('respond_organization_invitation_v1', {
+      p_actor_id: admin1Id, p_invitation_id: first.invitation_id, p_decision: 'ACCEPT',
+    });
+    assert.match(String(wrongTarget.error?.message || ''), /ORGANIZATION_INVITATION_TARGET_REQUIRED/);
+    await client.from('organization_invitations').update({ expires_at: new Date(0).toISOString() }).eq('id', first.invitation_id);
+    const expired = await client.rpc('respond_organization_invitation_v1', {
+      p_actor_id: inviteeId, p_invitation_id: first.invitation_id, p_decision: 'ACCEPT',
+    });
+    assert.ifError(expired.error);
+    assert.equal(expired.data.status, 'EXPIRED');
+
+    const { data: second, error: secondError } = await client.rpc('request_organization_invitation_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: inviteeId,
+      p_role: 'ACCOUNTANT', p_reason: 'Disposable invitation acceptance proof',
+    });
+    assert.ifError(secondError);
+    const responses = await Promise.all([
+      client.rpc('respond_organization_invitation_v1', { p_actor_id: inviteeId, p_invitation_id: second.invitation_id, p_decision: 'ACCEPT' }),
+      client.rpc('respond_organization_invitation_v1', { p_actor_id: inviteeId, p_invitation_id: second.invitation_id, p_decision: 'ACCEPT' }),
+    ]);
+    assert.equal(responses.filter((result) => !result.error && result.data?.status === 'ACCEPTED').length, 1);
+    assert.equal(responses.filter((result) => /ORGANIZATION_INVITATION_NOT_PENDING/.test(String(result.error?.message || ''))).length, 1);
+    const { data: member, error: memberError } = await client.from('users').select('organization_id,org_role').eq('id', inviteeId).single();
+    assert.ifError(memberError);
+    assert.equal(member.organization_id, organizationId);
+    assert.equal(member.org_role, 'ACCOUNTANT');
+
+    await client.from('treasury_approvers').insert({
+      organization_id: organizationId, user_id: inviteeId, role: 'APPROVER', status: 'ACTIVE',
+    });
+    const treasuryProtected = await client.rpc('request_organization_member_change_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: inviteeId,
+      p_action: 'CHANGE_ROLE', p_to_role: 'MEMBER', p_reason: 'Treasury assignment protection probe',
+    });
+    assert.match(String(treasuryProtected.error?.message || ''), /ORGANIZATION_MEMBER_CHANGE_TREASURY_TARGET/);
+    await client.from('treasury_approvers').delete().eq('user_id', inviteeId);
+
+    const { data: roleRequestId, error: roleRequestError } = await client.rpc('request_organization_member_change_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: inviteeId,
+      p_action: 'CHANGE_ROLE', p_to_role: 'MEMBER', p_reason: 'Move certification member to base role',
+    });
+    assert.ifError(roleRequestError);
+    const targetReview = await client.rpc('respond_organization_member_change_v1', {
+      p_reviewer_id: inviteeId, p_request_id: roleRequestId, p_decision: 'APPROVE', p_reason: 'Target review must fail',
+    });
+    assert.match(String(targetReview.error?.message || ''), /ORGANIZATION_MEMBER_CHANGE_REVIEWER_REQUIRED/);
+    const roleReview = await client.rpc('respond_organization_member_change_v1', {
+      p_reviewer_id: admin2Id, p_request_id: roleRequestId, p_decision: 'APPROVE', p_reason: 'Independent role review approved',
+    });
+    assert.ifError(roleReview.error);
+
+    const { data: removeRequestId, error: removeRequestError } = await client.rpc('request_organization_member_change_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: inviteeId,
+      p_action: 'REMOVE_MEMBER', p_to_role: null, p_reason: 'Complete disposable member removal proof',
+    });
+    assert.ifError(removeRequestError);
+    const removals = await Promise.all([
+      client.rpc('respond_organization_member_change_v1', { p_reviewer_id: admin2Id, p_request_id: removeRequestId, p_decision: 'APPROVE', p_reason: 'Independent removal approved' }),
+      client.rpc('respond_organization_member_change_v1', { p_reviewer_id: admin2Id, p_request_id: removeRequestId, p_decision: 'APPROVE', p_reason: 'Concurrent duplicate removal' }),
+    ]);
+    assert.equal(removals.filter((result) => !result.error && result.data?.status === 'APPROVED').length, 1);
+    assert.equal(removals.filter((result) => /ORGANIZATION_MEMBER_CHANGE_NOT_PENDING/.test(String(result.error?.message || ''))).length, 1);
+    const { data: removed } = await client.from('users').select('organization_id,org_role').eq('id', inviteeId).single();
+    assert.equal(removed.organization_id, null);
+    assert.equal(removed.org_role, null);
+  },
+  { requireWrites: true, requiredEnv: TREASURY_FIXTURE_ENV },
+);
+
+dbIntegrationTest(
+  'organization leadership promotion and primary transfer enforce independent quorum',
+  async (t, client) => {
+    assert.equal(process.env.ORBI_DB_TEST_DISPOSABLE, 'true');
+    const makerId = requireEnv('ORBI_DB_TEST_TREASURY_MAKER_ID');
+    const admin1Id = requireEnv('ORBI_DB_TEST_TREASURY_ADMIN_1_ID');
+    const admin2Id = requireEnv('ORBI_DB_TEST_TREASURY_ADMIN_2_ID');
+    const crossOrgAdminId = requireEnv('ORBI_DB_TEST_TREASURY_CROSS_ORG_ADMIN_ID');
+    const organizationId = requireEnv('ORBI_DB_TEST_TREASURY_ORG_ID');
+    const targetId = '00000000-0000-0000-0000-000000000023';
+    t.after(async () => {
+      await client.from('organization_role_change_requests').delete().eq('target_user_id', targetId);
+      await client.from('organizations').update({ primary_admin_user_id: admin1Id }).eq('id', organizationId);
+      await client.from('users').update({ org_role: 'MEMBER', organization_id: organizationId }).eq('id', targetId);
+    });
+
+    const crossOrg = await client.rpc('request_organization_leadership_change_v1', {
+      p_actor_id: crossOrgAdminId, p_organization_id: organizationId, p_target_user_id: targetId,
+      p_action: 'ADD_ADMIN', p_to_role: null, p_reason: 'Cross organization leadership probe',
+    });
+    assert.match(String(crossOrg.error?.message || ''), /ORGANIZATION_LEADERSHIP_ADMIN_REQUIRED/);
+    const primaryRemoval = await client.rpc('request_organization_leadership_change_v1', {
+      p_actor_id: admin2Id, p_organization_id: organizationId, p_target_user_id: admin1Id,
+      p_action: 'REMOVE_ADMIN', p_to_role: 'MANAGER', p_reason: 'Primary lockout protection probe',
+    });
+    assert.match(String(primaryRemoval.error?.message || ''), /ORGANIZATION_LEADERSHIP_PRIMARY_TRANSFER_REQUIRED/);
+    const treasuryRemoval = await client.rpc('request_organization_leadership_change_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: admin2Id,
+      p_action: 'REMOVE_ADMIN', p_to_role: 'MANAGER', p_reason: 'Treasury separation protection probe',
+    });
+    assert.match(String(treasuryRemoval.error?.message || ''), /ORGANIZATION_LEADERSHIP_TREASURY_REMOVAL_REQUIRED/);
+
+    const { data: promotion, error: promotionError } = await client.rpc('request_organization_leadership_change_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: targetId,
+      p_action: 'ADD_ADMIN', p_to_role: null, p_reason: 'Disposable leadership promotion proof',
+    });
+    assert.ifError(promotionError);
+    assert.equal(Number(promotion.required_reviews), 2);
+    const firstReview = await client.rpc('respond_organization_leadership_change_v1', {
+      p_reviewer_id: admin2Id, p_request_id: promotion.request_id,
+      p_decision: 'APPROVE', p_reason: 'First independent promotion review',
+    });
+    assert.ifError(firstReview.error);
+    assert.equal(firstReview.data.status, 'PENDING');
+    const secondReview = await client.rpc('respond_organization_leadership_change_v1', {
+      p_reviewer_id: makerId, p_request_id: promotion.request_id,
+      p_decision: 'APPROVE', p_reason: 'Second independent promotion review',
+    });
+    assert.ifError(secondReview.error);
+    assert.equal(secondReview.data.status, 'EXECUTED');
+
+    const { data: transfer, error: transferError } = await client.rpc('request_organization_leadership_change_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: targetId,
+      p_action: 'TRANSFER_PRIMARY_ADMIN', p_to_role: null, p_reason: 'Disposable primary ownership transfer proof',
+    });
+    assert.ifError(transferError);
+    const transferReviews = await Promise.all([
+      client.rpc('respond_organization_leadership_change_v1', { p_reviewer_id: admin2Id, p_request_id: transfer.request_id, p_decision: 'APPROVE', p_reason: 'Primary transfer review one' }),
+      client.rpc('respond_organization_leadership_change_v1', { p_reviewer_id: makerId, p_request_id: transfer.request_id, p_decision: 'APPROVE', p_reason: 'Primary transfer review two' }),
+    ]);
+    transferReviews.forEach((result) => assert.ifError(result.error));
+    assert.equal(transferReviews.filter((result) => result.data?.status === 'EXECUTED').length, 1);
+    const { data: organization } = await client.from('organizations').select('primary_admin_user_id').eq('id', organizationId).single();
+    assert.equal(organization.primary_admin_user_id, targetId);
+
+    const protectedNewPrimary = await client.rpc('request_organization_leadership_change_v1', {
+      p_actor_id: admin1Id, p_organization_id: organizationId, p_target_user_id: targetId,
+      p_action: 'REMOVE_ADMIN', p_to_role: 'MANAGER', p_reason: 'New primary removal protection probe',
+    });
+    assert.match(String(protectedNewPrimary.error?.message || ''), /ORGANIZATION_LEADERSHIP_PRIMARY_TRANSFER_REQUIRED/);
+  },
+  { requireWrites: true, requiredEnv: TREASURY_FIXTURE_ENV },
 );
 
 if (!dbIntegrationEnabled || !hasDbIntegrationConfig() || !dbIntegrationWritesEnabled) {

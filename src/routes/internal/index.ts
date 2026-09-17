@@ -14,6 +14,7 @@ import { Messaging } from '../../../backend/features/MessagingService.js';
 import { OTPService } from '../../../backend/security/otpService.js';
 import { Identity } from '../../../iam/identityService.js';
 import { BusinessIdentity } from '../../../backend/business/BusinessIdentityService.js';
+import { firebasePushService } from '../../../backend/infrastructure/firebasePushService.js';
 import {
   createInternalWorkerMiddleware,
   getInternalAuditMetadata,
@@ -166,6 +167,8 @@ const TrustedGatewayEventSchema = z.object({
 });
 
 const ServicePaymentRequestSchema = z.object({
+  environment: z.enum(['sandbox', 'live']).default('live'),
+  simulationScenario: z.enum(['success', 'decline', 'timeout', 'requires_action']).optional(),
   intentId: z.string().min(1),
   serviceCode: z.string().min(1),
   operation: z.enum(['collection', 'payout', 'refund', 'paysafe']),
@@ -205,6 +208,15 @@ const IdentityResolveRequestSchema = z.object({
   serviceCode: z.string().min(1),
   identifier: z.string().trim().min(3).max(120),
   metadata: z.record(z.string(), z.unknown()).default({}),
+});
+
+const PayGatewayPushRequestSchema = z.object({
+  eventId: z.string().trim().min(1).max(160),
+  userId: z.string().uuid(),
+  title: z.string().trim().min(1).max(160),
+  body: z.string().trim().min(1).max(2000),
+  data: z.record(z.string(), z.unknown()).optional().default({}),
+  environment: z.enum(['sandbox', 'live']),
 });
 
 const BusinessRegistrationRequestSchema = z.object({
@@ -298,6 +310,8 @@ const buildSignedCoreToPayGatewayHeaders = (method: string, path: string, body: 
   const nonce = crypto.randomUUID();
   const requestId = crypto.randomUUID();
   const bodySha256 = hashInternalRequestBody(body);
+  const environment = String(process.env.ORBI_RUNTIME_ENVIRONMENT || '').toLowerCase();
+  if (!['sandbox','live'].includes(environment)) throw new Error('ORBI_RUNTIME_ENVIRONMENT_NOT_CONFIGURED');
   const canonicalPayload = [
     method.toUpperCase(),
     path,
@@ -306,6 +320,7 @@ const buildSignedCoreToPayGatewayHeaders = (method: string, path: string, body: 
     timestamp,
     nonce,
     requestId,
+    environment,
     bodySha256,
   ].join('\n');
   const signature = crypto.createHmac('sha256', signingSecret).update(canonicalPayload).digest('hex');
@@ -316,6 +331,7 @@ const buildSignedCoreToPayGatewayHeaders = (method: string, path: string, body: 
     'x-worker-request-id': requestId,
     'x-worker-timestamp': timestamp,
     'x-worker-nonce': nonce,
+    'x-orbi-environment': environment,
     'x-worker-signature': signature,
     'x-worker-key-id': process.env.WORKER_KEY_ID || 'orbi-core-v1',
   };
@@ -1035,10 +1051,23 @@ export const registerInternalRoutes = (internal: Router) => {
 
     const workerId = String((req as any).internalWorker?.id || req.get('x-worker-id') || 'payment-gateway');
     const request = parsed.data;
+    const signedEnvironment = String((req as any).internalRequestIdentity?.environment || '');
+    if (signedEnvironment !== request.environment) return res.status(403).json({ success: false, error: 'REQUEST_ENVIRONMENT_MISMATCH' });
     let event: ServicePaymentCoreEvent | null = null;
     let resolvedCustomer: Record<string, any> | null = null;
 
     try {
+      if (request.environment === 'sandbox') {
+        if (process.env.ORBI_ENABLE_SANDBOX_ROUTES !== 'true') throw new Error('SANDBOX_ROUTES_DISABLED');
+        if (!request.simulationScenario) throw new Error('SANDBOX_SCENARIO_REQUIRED');
+        const simulation = await gatewayPaymentIntentService.simulateSandbox({
+          intentId: request.intentId, serviceCode: request.serviceCode, reference: request.reference,
+          operation: request.operation, scenario: request.simulationScenario, amount: request.amount,
+          currency: request.currency, requestPayload: request as unknown as Record<string, unknown>,
+        });
+        await Audit.log('FINANCIAL', workerId, 'SANDBOX_PAYMENT_SIMULATED', { serviceCode: request.serviceCode, intentId: request.intentId, scenario: request.simulationScenario, status: simulation.status, replayed: simulation.replayed, ...getInternalAuditMetadata(req) });
+        return res.json({ success: true, data: simulation });
+      }
       const paySafeFundingRoute = resolvePaySafeFundingRoute(request);
       const sb = getAdminSupabase() || getSupabase();
       if (!sb) throw new Error('DB_OFFLINE');
@@ -1518,6 +1547,41 @@ export const registerInternalRoutes = (internal: Router) => {
       }).catch(() => undefined);
       return res.status(quoteErrorStatus(message)).json({ success: false, error: message });
     }
+  });
+
+  internal.post('/pay-gateway/notifications/push', requireWorkerScope(['gateway:notifications:push']), async (req, res) => {
+    const parsed = PayGatewayPushRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: 'PUSH_NOTIFICATION_REQUEST_INVALID' });
+    }
+    const signedEnvironment = String((req as any).internalRequestIdentity?.environment || '');
+    if (signedEnvironment !== parsed.data.environment) {
+      return res.status(403).json({ success: false, error: 'PUSH_NOTIFICATION_ENVIRONMENT_MISMATCH' });
+    }
+    const sb = getAdminSupabase();
+    if (!sb) return res.status(503).json({ success: false, error: 'IDENTITY_STORE_UNAVAILABLE' });
+    const userResult = await sb.from('users').select('fcm_token, notif_push').eq('id', parsed.data.userId).maybeSingle();
+    const staffResult = userResult.data ? null : await sb.from('staff').select('fcm_token, notif_push').eq('id', parsed.data.userId).maybeSingle();
+    const profile = userResult.data || staffResult?.data;
+    if (!profile) return res.status(404).json({ success: false, error: 'PUSH_RECIPIENT_NOT_FOUND' });
+    if (profile.notif_push === false) return res.status(409).json({ success: false, error: 'PUSH_RECIPIENT_OPTED_OUT' });
+    if (!profile.fcm_token) return res.status(409).json({ success: false, error: 'PUSH_DEVICE_TOKEN_MISSING' });
+
+    const receipt = await firebasePushService.sendWithReceipt({
+      token: profile.fcm_token,
+      title: parsed.data.title,
+      body: parsed.data.body,
+      data: { ...parsed.data.data, eventId: parsed.data.eventId, event_origin: 'ORBI_PAY_GATEWAY' },
+      requestId: parsed.data.eventId,
+    });
+    await Audit.log('SECURITY', parsed.data.userId, 'PAY_GATEWAY_PUSH_DELIVERY_ATTEMPTED', {
+      eventId: parsed.data.eventId,
+      status: receipt.status,
+      providerMessageId: receipt.messageId || null,
+      ...getInternalAuditMetadata(req),
+    }).catch(() => undefined);
+    const statusCode = receipt.status === 'sent' ? 200 : receipt.status === 'invalid_token' ? 410 : 503;
+    return res.status(statusCode).json({ success: receipt.status === 'sent', data: receipt });
   });
 
   internal.post('/pay-gateway/identity-resolve', requireWorkerScope(['gateway:identity:read']), async (req, res) => {

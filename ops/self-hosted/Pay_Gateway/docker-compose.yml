@@ -1,4 +1,89 @@
 services:
+  keycloak-postgres-sandbox:
+    profiles: [sandbox]
+    image: postgres:16-bookworm
+    container_name: orbi-keycloak-postgres-sandbox
+    restart: unless-stopped
+    env_file:
+      - ${ORBI_KEYCLOAK_SANDBOX_ENV_FILE:-D:/FYNIX/ORBI/SECREATES/ORBI KEYCLOAK SANDBOX ENV.txt}
+    volumes:
+      - orbi_keycloak_postgres_sandbox:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [orbi_private]
+
+  keycloak-sandbox:
+    profiles: [sandbox]
+    image: keycloak/keycloak:26.5.0
+    container_name: orbi-keycloak-sandbox
+    restart: unless-stopped
+    command: start --import-realm
+    env_file:
+      - ${ORBI_KEYCLOAK_SANDBOX_ENV_FILE:-D:/FYNIX/ORBI/SECREATES/ORBI KEYCLOAK SANDBOX ENV.txt}
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-postgres-sandbox:5432/keycloak_sandbox
+      KC_DB_USERNAME: orbi_keycloak_sandbox
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME: https://auth.orbifinancial.com
+      KC_HOSTNAME_STRICT: "true"
+    volumes:
+      - ../Auth_Security/keycloak/orbi-sandbox-realm.json:/opt/keycloak/data/import/orbi-sandbox-realm.json:ro
+    depends_on:
+      keycloak-postgres-sandbox:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8082:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nhost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    networks:
+      orbi_private:
+        aliases: [orbi-keycloak-sandbox]
+      orbi_edge:
+        aliases: [keycloak-sandbox]
+
+  pay-gateway-postgres-live:
+    profiles: [live]
+    image: postgres:16-bookworm
+    container_name: orbi-pay-gateway-postgres-live
+    restart: unless-stopped
+    env_file:
+      - ${ORBI_PAY_GATEWAY_LIVE_ENV_FILE:-D:/FYNIX/ORBI/SECREATES/ORBI PAY GATEWAY LIVE ENV.txt}
+    volumes:
+      - orbi_pay_gateway_postgres_live:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [orbi_private]
+
+  pay-gateway-postgres-sandbox:
+    profiles: [sandbox]
+    image: postgres:16-bookworm
+    container_name: orbi-pay-gateway-postgres-sandbox
+    restart: unless-stopped
+    env_file:
+      - ${ORBI_PAY_GATEWAY_SANDBOX_ENV_FILE:-D:/FYNIX/ORBI/SECREATES/ORBI PAY GATEWAY SANDBOX ENV.txt}
+    volumes:
+      - orbi_pay_gateway_postgres_sandbox:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [orbi_private]
+
   pay-gateway:
     profiles:
       - live
@@ -18,7 +103,8 @@ services:
       PAYMENT_GATEWAY_CREDENTIAL_MODE: tokenized
       PAYMENT_GATEWAY_REQUIRE_STRONG_CUSTOMER_AUTH: "true"
       PAYMENT_GATEWAY_INTERNAL_CORE_TRANSPORT_MODE: private_http
-      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER:-https://pay.orbifinancial.com}
+      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER:-https://auth.orbifinancial.com/realms/orbi}
+      PAYMENT_GATEWAY_OIDC_IDENTITY_BACKCHANNEL_URL: http://orbi-keycloak:8080/realms/orbi
       PAYMENT_GATEWAY_OIDC_IDENTITY_AUDIENCE: ${PAYMENT_GATEWAY_OIDC_IDENTITY_AUDIENCE:-orbi-pay-identity}
       PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID: ${PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID:-orbi-pay-developers}
       PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE: ${PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE:-orbi-pay-api}
@@ -53,6 +139,9 @@ services:
       - ${ORBI_PAY_GATEWAY_MTLS_CERT_DIRECTORY:-D:/FYNIX/ORBI/SECREATES/ORBI_MTLS}:/opt/orbi/mtls:ro
     ports:
       - "${ORBI_PAY_GATEWAY_BIND_ADDRESS:-127.0.0.1}:3100:3100"
+    depends_on:
+      pay-gateway-postgres-live:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -88,7 +177,10 @@ services:
       PAYMENT_GATEWAY_CREDENTIAL_MODE: tokenized
       PAYMENT_GATEWAY_REQUIRE_STRONG_CUSTOMER_AUTH: "true"
       PAYMENT_GATEWAY_INTERNAL_CORE_TRANSPORT_MODE: private_http
-      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_SANDBOX_OIDC_IDENTITY_ISSUER:-https://sandbox-pay.orbifinancial.com}
+      PAYMENT_GATEWAY_OIDC_IDENTITY_ISSUER: ${PAYMENT_GATEWAY_SANDBOX_OIDC_IDENTITY_ISSUER:-https://auth.orbifinancial.com/realms/orbi-sandbox}
+      # Temporary compatibility route until Cloudflare maps the public sandbox
+      # identity hostname to keycloak-sandbox. Switching early causes JWKS mismatch.
+      PAYMENT_GATEWAY_OIDC_IDENTITY_BACKCHANNEL_URL: http://keycloak-sandbox:8080/realms/orbi-sandbox
       PAYMENT_GATEWAY_OIDC_IDENTITY_AUDIENCE: ${PAYMENT_GATEWAY_SANDBOX_OIDC_IDENTITY_AUDIENCE:-orbi-pay-sandbox-identity}
       PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID: ${PAYMENT_GATEWAY_SANDBOX_OIDC_AUTHORIZATION_CLIENT_ID:-orbi-pay-sandbox-developers}
       PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE: ${PAYMENT_GATEWAY_SANDBOX_FINANCIAL_TOKEN_AUDIENCE:-orbi-pay-sandbox-api}
@@ -113,6 +205,9 @@ services:
       ORBI_TALK_MESSAGING_INTENT_PATH: /api/send-email
       ORBI_TALK_GATEWAY_TIMEOUT_MS: ${ORBI_TALK_GATEWAY_TIMEOUT_MS:-2500}
       PAYMENT_GATEWAY_MESSAGING_DELIVERY_STORE_PATH: /app/messaging/messaging-deliveries.json
+      ORBI_CORE_INTERNAL_BASE_URL: http://core-sandbox:3001
+      ORBI_CORE_TRUSTED_PUSH_NOTIFICATION_PATH: /api/internal/pay-gateway/notifications/push
+      PAYMENT_GATEWAY_WORKER_SCOPES: gateway:events:write,gateway:service-payments:write,gateway:service-payments:result,gateway:identity:read,gateway:notifications:push,gateway:paysafe-balances:read,gateway:business-registration:write,gateway:payment-profiles:write,gateway:merchant-payments:read,gateway:merchant-settlements:read
     volumes:
       - ${ORBI_PAY_GATEWAY_BACKEND_ROOT:-../../../../../../ORBI GATEWAY/Pay Gateway Backend}/config/providers.example.json:/app/config/providers.json:ro
       - ${ORBI_PAY_GATEWAY_BACKEND_ROOT:-../../../../../../ORBI GATEWAY/Pay Gateway Backend}/config/services.json:/app/config/services.json:ro
@@ -123,6 +218,11 @@ services:
       - ${ORBI_PAY_GATEWAY_SANDBOX_MTLS_CERT_DIRECTORY:-D:/FYNIX/ORBI/SECREATES/ORBI_MTLS_SANDBOX}:/opt/orbi/mtls:ro
     ports:
       - "${ORBI_PAY_GATEWAY_SANDBOX_BIND_ADDRESS:-127.0.0.1}:3101:3101"
+    depends_on:
+      pay-gateway-postgres-sandbox:
+        condition: service_healthy
+      keycloak-sandbox:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -138,6 +238,7 @@ services:
     networks:
       - orbi_private
       - orbi_edge
+      - orbi_sandbox_private
 
 networks:
   orbi_private:
@@ -146,3 +247,11 @@ networks:
   orbi_edge:
     name: orbi-edge
     external: true
+  orbi_sandbox_private:
+    name: orbi_sandbox_private
+    external: true
+
+volumes:
+  orbi_pay_gateway_postgres_live:
+  orbi_pay_gateway_postgres_sandbox:
+  orbi_keycloak_postgres_sandbox:
