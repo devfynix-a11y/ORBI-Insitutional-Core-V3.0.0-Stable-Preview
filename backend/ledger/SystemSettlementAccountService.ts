@@ -37,6 +37,44 @@ export class SystemSettlementAccountService {
     }
     return String(vault.id);
   }
+
+  /**
+   * Verifies that a company settlement account can cover an immediate debit.
+   * This is a readiness check only; the atomic ledger posting remains the
+   * authority at settlement time.
+   */
+  async requireAvailableBalance(
+    role: SettlementAccountRole,
+    currency: string,
+    requiredAmount: number,
+  ): Promise<{ vaultId: string; availableAmount: number }> {
+    const code = normalizeCurrency(currency);
+    const required = Number(requiredAmount);
+    if (!Number.isFinite(required) || required <= 0) {
+      throw new Error(`SETTLEMENT_LIQUIDITY_AMOUNT_INVALID:${role}:${code}`);
+    }
+
+    const vaultId = await this.resolve(role, code);
+    const sb = getAdminSupabase();
+    if (!sb) throw new Error('SETTLEMENT_ACCOUNT_STORE_UNAVAILABLE');
+    const { data: vault, error } = await sb
+      .from('platform_vaults')
+      .select('balance, currency, is_locked, status')
+      .eq('id', vaultId)
+      .maybeSingle();
+    if (error) throw new Error(`SETTLEMENT_VAULT_LOOKUP_FAILED:${error.message}`);
+    if (!vault || normalizeCurrency(vault.currency) !== code || vault.is_locked || String(vault.status).toLowerCase() !== 'active') {
+      throw new Error(`SETTLEMENT_ACCOUNT_INVALID:${role}:${code}`);
+    }
+
+    const availableAmount = Number(vault.balance || 0);
+    if (!Number.isFinite(availableAmount) || availableAmount < required) {
+      throw new Error(
+        `FX_SETTLEMENT_LIQUIDITY_UNAVAILABLE:${code}:required=${required.toFixed(4)}:available=${Number.isFinite(availableAmount) ? availableAmount.toFixed(4) : '0.0000'}`,
+      );
+    }
+    return { vaultId, availableAmount };
+  }
 }
 
 export const systemSettlementAccounts = new SystemSettlementAccountService();

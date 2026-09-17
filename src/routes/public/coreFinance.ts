@@ -8,6 +8,7 @@ import { GlobalTimeResolver } from '../../../backend/utils/GlobalTimeResolver.js
 import { TransactionMovementClassifier } from '../../../backend/transactions/movement/TransactionMovementClassifier.js';
 import { DataProtection } from '../../../backend/security/DataProtection.js';
 import { signLockedFxSnapshot } from '../../../backend/ledger/FXLockedQuote.js';
+import { systemSettlementAccounts } from '../../../backend/ledger/SystemSettlementAccountService.js';
 
 type Deps = {
   authenticate: RequestHandler;
@@ -1568,6 +1569,21 @@ export const registerCoreFinanceRoutes = (v1: Router, deps: Deps) => {
           retryable: false,
         });
       }
+
+      // A locked quote is a commitment to settle. Confirm the exact target
+      // currency clearing account can fund the target-side debit before a
+      // customer is allowed to proceed to confirmation. The ledger RPC still
+      // performs the final locked balance check during settlement.
+      const targetLiquidityRequired = Number((
+        Number(result.finalAmount || 0) +
+        Number(result.spreadAmount || 0) +
+        Number(result.feeInTargetCurrency || result.fee || 0)
+      ).toFixed(4));
+      await systemSettlementAccounts.requireAvailableBalance(
+        'FX_CLEARING',
+        to,
+        targetLiquidityRequired,
+      );
 
       const quoteId = `fx_${randomUUID()}`;
       const description = String(req.query.description || `FX conversion ${from} to ${to}`).trim();
