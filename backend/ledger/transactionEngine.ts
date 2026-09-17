@@ -506,7 +506,7 @@ export class BankingEngineService {
 
                     await this.addFxSpreadLegs(legs, txId, fxDetails, targetCurrency);
 
-                    // 4. Credit Fee Collector (FX Fee in Target Currency)
+                    // 4. Credit company service revenue (FX fee in target currency)
                     const fxFeeTargetAmount = fxDetails.feeInTargetCurrency || fxDetails.fee || 0;
                     if (this.isPositiveAmount(fxFeeTargetAmount)) {
                         const feeCollectorId = await systemSettlementAccounts.resolve('SERVICE_REVENUE', targetCurrency);
@@ -594,7 +594,7 @@ export class BankingEngineService {
 
                 await this.addFxSpreadLegs(legs, txId, fxDetails, targetCurrency);
 
-                // Credit Fee Collector (FX Fee in Target Currency)
+                // Credit company service revenue (FX fee in target currency)
                 const fxFeeTargetAmount = fxDetails.feeInTargetCurrency || fxDetails.fee || 0;
                 if (this.isPositiveAmount(fxFeeTargetAmount)) {
                         const feeCollectorId = await systemSettlementAccounts.resolve('SERVICE_REVENUE', targetCurrency);

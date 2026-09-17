@@ -29,11 +29,22 @@ test('merchant PaySafe settlement is durable, balanced, and SQL-authoritative', 
 test('merchant settlement posts gross debit, merchant net credit, and fee credit', () => {
   assert.match(migration, /PaySafe merchant settlement debit/);
   assert.match(migration, /PaySafe merchant net settlement/);
-  assert.match(migration, /PaySafe merchant fee settlement/);
+  assert.match(migration, /PaySafe merchant service revenue/);
+  assert.match(migration, /PaySafe merchant statutory tax reserve/);
+  assert.match(migration, /system_settlement_accounts/);
   assert.match(migration, /UPDATE public\.platform_vaults/);
   assert.match(migration, /UPDATE public\.merchant_wallets/);
   assert.match(migration, /INSERT INTO public\.merchant_paysafe_settlements/);
   assert.match(migration, /INSERT INTO public\.settlement_lifecycle/);
+});
+
+test('merchant PaySafe fees have no legacy fee-collector fallback', () => {
+  const start = migration.indexOf('CREATE OR REPLACE FUNCTION public.settle_merchant_paysafe_v1(');
+  const end = migration.indexOf('\n$$;', start);
+  const settlement = migration.slice(start, end);
+  assert.match(settlement, /ssa\.role = 'SERVICE_REVENUE'/);
+  assert.match(settlement, /ssa\.role = 'TAX_RESERVE'/);
+  assert.doesNotMatch(settlement, /fee_collector_wallets|v_fee_collector|PAYSAFE_FEE_COLLECTOR/);
 });
 
 test('merchant PaySafe settlement is service-role only and idempotent', () => {

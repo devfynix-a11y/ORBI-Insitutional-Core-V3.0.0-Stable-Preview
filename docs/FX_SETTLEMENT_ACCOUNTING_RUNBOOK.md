@@ -18,8 +18,9 @@ currency must match every ledger leg.
 | `FX_RISK_RESERVE` | FX risk buffer | Treasury reserve, not revenue |
 | `COMMISSION_RESERVE` | Commission funding | Agent, merchant, and referral payout reserve |
 
-`FEE_COLLECTOR` exists only as a legacy reporting alias. New transaction code
-must resolve the role and currency from `system_settlement_accounts`.
+## Strict routing
+
+No transaction may fall back to `FEE_COLLECTOR`, an environment variable, or an arbitrary wallet identifier. A missing, paused, locked, or incorrectly denominated company settlement account must reject the transaction. Legacy fee-collector data remains historical evidence only and is never used for routing or fee reporting.
 
 ## FX transaction lifecycle
 
@@ -61,6 +62,8 @@ backend code:
 
 1. `20260925_system_settlement_accounts.sql`
 2. `20260926_currency_balanced_ledger.sql`
+3. `20260927_remove_legacy_fee_collector_fallback.sql`
+4. `20260928_strict_card_fee_settlement.sql`
 
 After applying them, query `system_settlement_accounts` and confirm one active
 account for each role/currency pair. Do not enable a new currency merely

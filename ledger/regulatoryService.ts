@@ -7,7 +7,7 @@ import { Storage } from '../backend/storage.js';
 import { providerSecretVault } from '../backend/payments/providers/ProviderSecretVault.js';
 import crypto from 'crypto';
 
-export type SystemNodeRole = 'GOV_TAX' | 'SERVICE_FEE' | 'ESCROW_VAULT' | 'BANK_POOL' | 'FEE_COLLECTOR' | 'OPERATIONAL_RESERVE';
+export type SystemNodeRole = 'GOV_TAX' | 'SERVICE_FEE' | 'ESCROW_VAULT' | 'BANK_POOL' | 'OPERATIONAL_RESERVE';
 
 class RegulatoryControl {
     private readonly STORAGE_KEY = 'orbi_regulatory_node_v13';
@@ -18,7 +18,6 @@ class RegulatoryControl {
         SERVICE_FEE: '00000000-0000-0000-0000-000000000002',
         ESCROW_VAULT: '00000000-0000-0000-0000-000000000003',
         BANK_POOL: '00000000-0000-0000-0000-000000000004',
-        FEE_COLLECTOR: '00000000-0000-0000-0000-000000000005',
         OPERATIONAL_RESERVE: '00000000-0000-0000-0000-000000000006'
     };
 
@@ -228,6 +227,5 @@ export const SYSTEM_NODES = {
     SERVICE_FEE: 'SERVICE_FEE' as SystemNodeRole,
     TAX_ESCROW: 'GOV_TAX' as SystemNodeRole,
     ESCROW_VAULT: 'ESCROW_VAULT' as SystemNodeRole,
-    FEE_COLLECTOR: 'FEE_COLLECTOR' as SystemNodeRole,
     OPERATIONAL_RESERVE: 'OPERATIONAL_RESERVE' as SystemNodeRole
 };

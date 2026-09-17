@@ -6201,9 +6201,6 @@ DECLARE
     enc_zero TEXT := 'enc_v2_eyJ2ZXJzaW9uIjoxLCJpdiI6IkFBQUFBQUFBQUFBQSIsImNpcGhlcnRleHQiOiJBQUFBQUFBQUFBQUEiLCJ0YWciOiJBQUFBQUFBQUFBQUEiLCJ0aW1lc3RhbXAiOjAsImtleUlkIjoicC1ub2RlLWFjdGl2ZSIsImFsZ29yaXRobSI6IkFFUy1HQ00tMjU2In0=';
 BEGIN
     -- Provision System Vaults
-    INSERT INTO public.platform_vaults (id, user_id, vault_role, name, balance, encrypted_balance, currency, color, icon)
-    VALUES ('00000000-0000-0000-0000-000000000003', NULL, 'FEE_COLLECTOR', 'System Fee Collector', 0, enc_zero, 'USD', '#F59E0B', 'bank')
-    ON CONFLICT (id) DO NOTHING;
 
     INSERT INTO public.platform_vaults (id, user_id, vault_role, name, balance, encrypted_balance, currency, color, icon)
     VALUES ('00000000-0000-0000-0000-000000000001', NULL, 'ESCROW_VAULT', 'System Escrow Vault', 0, enc_zero, 'USD', '#6366F1', 'shield-check')
@@ -6217,21 +6214,10 @@ BEGIN
     VALUES ('00000000-0000-0000-0000-000000000005', NULL, 'FX_CLEARING', 'System FX Clearing', 0, enc_zero, 'USD', '#0EA5E9', 'currency-exchange')
     ON CONFLICT (id) DO NOTHING;
 
-    -- Provision Fee Collector Wallets
-    INSERT INTO public.fee_collector_wallets (fee_type, vault_id, currency)
-    VALUES ('GOV_TAX', '00000000-0000-0000-0000-000000000004', 'TZS')
-    ON CONFLICT (fee_type) DO NOTHING;
-
-    INSERT INTO public.fee_collector_wallets (fee_type, vault_id, currency)
-    VALUES ('SERVICE_FEE', '00000000-0000-0000-0000-000000000003', 'TZS')
-    ON CONFLICT (fee_type) DO NOTHING;
-
     -- Map System Nodes
-    INSERT INTO public.system_nodes (node_type, vault_id) VALUES ('FEE_COLLECTOR', '00000000-0000-0000-0000-000000000003') ON CONFLICT (node_type) DO UPDATE SET vault_id = EXCLUDED.vault_id;
     INSERT INTO public.system_nodes (node_type, vault_id) VALUES ('ESCROW_VAULT', '00000000-0000-0000-0000-000000000001') ON CONFLICT (node_type) DO UPDATE SET vault_id = EXCLUDED.vault_id;
     INSERT INTO public.system_nodes (node_type, vault_id) VALUES ('TAX_RESERVE', '00000000-0000-0000-0000-000000000004') ON CONFLICT (node_type) DO UPDATE SET vault_id = EXCLUDED.vault_id;
     INSERT INTO public.system_nodes (node_type, vault_id) VALUES ('FX_CLEARING', '00000000-0000-0000-0000-000000000005') ON CONFLICT (node_type) DO UPDATE SET vault_id = EXCLUDED.vault_id;
-    INSERT INTO public.system_nodes (node_type, vault_id) VALUES ('PLATFORM_FEE', '00000000-0000-0000-0000-000000000003') ON CONFLICT (node_type) DO UPDATE SET vault_id = EXCLUDED.vault_id;
     INSERT INTO public.system_nodes (node_type, vault_id) VALUES ('GOV_TAX', '00000000-0000-0000-0000-000000000004') ON CONFLICT (node_type) DO UPDATE SET vault_id = EXCLUDED.vault_id;
 END $$;
 
@@ -6545,196 +6531,64 @@ RETURNS JSONB AS $$
 DECLARE
     v_card_tx public.card_transactions%ROWTYPE;
     v_target_wallet public.wallets%ROWTYPE;
-    v_fee_wallet public.wallets%ROWTYPE;
-    v_fee_vault public.platform_vaults%ROWTYPE;
+    v_service_revenue_vault public.platform_vaults%ROWTYPE;
     v_financial_tx public.transactions%ROWTYPE;
+    v_currency TEXT;
     v_target_balance_after NUMERIC;
-    v_fee_balance_before NUMERIC := 0;
     v_fee_balance_after NUMERIC := 0;
     v_reference_id TEXT;
 BEGIN
-    IF p_card_transaction_id IS NULL OR trim(p_card_transaction_id) = '' THEN
-        RAISE EXCEPTION 'CARD_TRANSACTION_REQUIRED';
-    END IF;
+    IF p_card_transaction_id IS NULL OR trim(p_card_transaction_id) = '' THEN RAISE EXCEPTION 'CARD_TRANSACTION_REQUIRED'; END IF;
+    IF p_target_wallet_id IS NULL THEN RAISE EXCEPTION 'TARGET_WALLET_REQUIRED'; END IF;
 
-    IF p_target_wallet_id IS NULL THEN
-        RAISE EXCEPTION 'TARGET_WALLET_REQUIRED';
-    END IF;
+    SELECT * INTO v_card_tx FROM public.card_transactions WHERE id = p_card_transaction_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'CARD_TRANSACTION_NOT_FOUND'; END IF;
+    IF upper(COALESCE(v_card_tx.status, '')) <> 'AUTHORIZED' THEN RAISE EXCEPTION 'CARD_TRANSACTION_NOT_AUTHORIZED'; END IF;
 
-    SELECT *
-      INTO v_card_tx
-      FROM public.card_transactions
-     WHERE id = p_card_transaction_id
-     FOR UPDATE;
+    SELECT * INTO v_target_wallet FROM public.wallets WHERE id = p_target_wallet_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'TARGET_WALLET_NOT_FOUND'; END IF;
+    IF COALESCE(v_card_tx.amount, 0) <= 0 THEN RAISE EXCEPTION 'INVALID_CARD_SETTLEMENT_AMOUNT'; END IF;
+    IF COALESCE(p_fee_amount, 0) < 0 THEN RAISE EXCEPTION 'INVALID_FEE_AMOUNT'; END IF;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'CARD_TRANSACTION_NOT_FOUND';
-    END IF;
-
-    IF upper(COALESCE(v_card_tx.status, '')) <> 'AUTHORIZED' THEN
-        RAISE EXCEPTION 'CARD_TRANSACTION_NOT_AUTHORIZED';
-    END IF;
-
-    SELECT *
-      INTO v_target_wallet
-      FROM public.wallets
-     WHERE id = p_target_wallet_id
-     FOR UPDATE;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'TARGET_WALLET_NOT_FOUND';
-    END IF;
-
-    IF COALESCE(v_card_tx.amount, 0) <= 0 THEN
-        RAISE EXCEPTION 'INVALID_CARD_SETTLEMENT_AMOUNT';
-    END IF;
-
-    IF COALESCE(p_fee_amount, 0) < 0 THEN
-        RAISE EXCEPTION 'INVALID_FEE_AMOUNT';
-    END IF;
+    v_currency := upper(COALESCE(NULLIF(trim(v_card_tx.currency), ''), 'TZS'));
+    IF upper(COALESCE(v_target_wallet.currency, '')) <> v_currency THEN RAISE EXCEPTION 'CARD_SETTLEMENT_CURRENCY_MISMATCH'; END IF;
 
     IF COALESCE(p_fee_amount, 0) > 0 THEN
-        IF p_fee_wallet_id IS NULL THEN
-            RAISE EXCEPTION 'SYSTEM_FEE_WALLET_REQUIRED';
-        END IF;
-
-        SELECT *
-          INTO v_fee_wallet
-          FROM public.wallets
-         WHERE id = p_fee_wallet_id
-         FOR UPDATE;
-
-        IF NOT FOUND THEN
-            SELECT *
-              INTO v_fee_vault
-              FROM public.platform_vaults
-             WHERE id = p_fee_wallet_id
-             FOR UPDATE;
-        END IF;
-
-        IF v_fee_wallet.id IS NULL AND v_fee_vault.id IS NULL THEN
-            RAISE EXCEPTION 'SYSTEM_FEE_WALLET_NOT_FOUND';
-        END IF;
-
-        v_fee_balance_before := COALESCE(v_fee_wallet.balance, v_fee_vault.balance, 0);
-        v_fee_balance_after := v_fee_balance_before + p_fee_amount;
+        SELECT pv.* INTO v_service_revenue_vault
+        FROM public.system_settlement_accounts ssa
+        JOIN public.platform_vaults pv ON pv.id = ssa.vault_id
+        WHERE ssa.role = 'SERVICE_REVENUE'
+          AND ssa.currency = v_currency
+          AND ssa.status = 'ACTIVE'
+          AND upper(COALESCE(pv.currency, '')) = v_currency
+          AND NOT COALESCE(pv.is_locked, FALSE)
+          AND lower(COALESCE(pv.status, 'active')) = 'active'
+        FOR UPDATE OF pv;
+        IF NOT FOUND THEN RAISE EXCEPTION 'CARD_SERVICE_REVENUE_ACCOUNT_UNAVAILABLE:%', v_currency; END IF;
+        IF p_fee_wallet_id IS DISTINCT FROM v_service_revenue_vault.id THEN RAISE EXCEPTION 'CARD_FEE_ACCOUNT_MISMATCH'; END IF;
+        v_fee_balance_after := COALESCE(v_service_revenue_vault.balance, 0) + p_fee_amount;
     END IF;
 
     v_target_balance_after := COALESCE(v_target_wallet.balance, 0) + COALESCE(v_card_tx.amount, 0);
     v_reference_id := 'card_' || trim(p_card_transaction_id);
 
-    INSERT INTO public.transactions (
-        id,
-        reference_id,
-        user_id,
-        wallet_id,
-        to_wallet_id,
-        amount,
-        currency,
-        description,
-        type,
-        status,
-        date,
-        metadata
-    ) VALUES (
-        gen_random_uuid(),
-        v_reference_id,
-        COALESCE(v_target_wallet.user_id, v_card_tx.user_id),
-        NULL,
-        v_target_wallet.id,
-        v_card_tx.amount::text,
-        upper(COALESCE(NULLIF(trim(v_card_tx.currency), ''), 'TZS')),
-        'Card payment settlement - ' || p_card_transaction_id,
-        'deposit',
-        'completed',
-        CURRENT_DATE,
-        jsonb_build_object(
-            'card_transaction_id', p_card_transaction_id,
-            'source_wallet_type', 'EXTERNAL',
-            'target_wallet_type', COALESCE(v_target_wallet.wallet_type, 'INTERNAL'),
-            'settlement_path', 'SOVEREIGN_LEDGER',
-            'fee_wallet_id', p_fee_wallet_id
-        )
-    )
+    INSERT INTO public.transactions (id, reference_id, user_id, wallet_id, to_wallet_id, amount, currency, description, type, status, date, metadata)
+    VALUES (gen_random_uuid(), v_reference_id, COALESCE(v_target_wallet.user_id, v_card_tx.user_id), NULL, v_target_wallet.id, v_card_tx.amount::text, v_currency, 'Card payment settlement - ' || p_card_transaction_id, 'deposit', 'completed', CURRENT_DATE, jsonb_build_object('card_transaction_id', p_card_transaction_id, 'source_wallet_type', 'EXTERNAL', 'target_wallet_type', COALESCE(v_target_wallet.wallet_type, 'INTERNAL'), 'settlement_path', 'SOVEREIGN_LEDGER', 'service_revenue_vault_id', CASE WHEN p_fee_amount > 0 THEN v_service_revenue_vault.id ELSE NULL END))
     RETURNING * INTO v_financial_tx;
 
-    INSERT INTO public.financial_ledger (
-        id,
-        transaction_id,
-        user_id,
-        wallet_id,
-        entry_type,
-        amount,
-        balance_after,
-        description
-    ) VALUES (
-        gen_random_uuid(),
-        v_financial_tx.id,
-        COALESCE(v_target_wallet.user_id, v_card_tx.user_id),
-        v_target_wallet.id,
-        'CREDIT',
-        v_card_tx.amount::text,
-        v_target_balance_after::text,
-        'Card deposit - ' || p_card_transaction_id
-    );
+    INSERT INTO public.financial_ledger (id, transaction_id, user_id, wallet_id, entry_type, amount, balance_after, description, currency)
+    VALUES (gen_random_uuid(), v_financial_tx.id, COALESCE(v_target_wallet.user_id, v_card_tx.user_id), v_target_wallet.id, 'CREDIT', v_card_tx.amount::text, v_target_balance_after::text, 'Card deposit - ' || p_card_transaction_id, v_currency);
 
     IF COALESCE(p_fee_amount, 0) > 0 THEN
-        INSERT INTO public.financial_ledger (
-            id,
-            transaction_id,
-            user_id,
-            wallet_id,
-            entry_type,
-            amount,
-            balance_after,
-            description
-        ) VALUES (
-            gen_random_uuid(),
-            v_financial_tx.id,
-            COALESCE(v_target_wallet.user_id, v_card_tx.user_id),
-            COALESCE(v_fee_wallet.id, v_fee_vault.id),
-            'CREDIT',
-            p_fee_amount::text,
-            v_fee_balance_after::text,
-            'Card processor fee - ' || p_card_transaction_id
-        );
+        UPDATE public.platform_vaults SET balance = v_fee_balance_after, updated_at = NOW() WHERE id = v_service_revenue_vault.id;
+        INSERT INTO public.financial_ledger (id, transaction_id, user_id, wallet_id, entry_type, amount, balance_after, description, currency)
+        VALUES (gen_random_uuid(), v_financial_tx.id, v_service_revenue_vault.user_id, v_service_revenue_vault.id, 'CREDIT', p_fee_amount::text, v_fee_balance_after::text, 'Card processor service revenue - ' || p_card_transaction_id, v_currency);
     END IF;
 
-    UPDATE public.wallets
-       SET balance = v_target_balance_after,
-           updated_at = NOW()
-     WHERE id = v_target_wallet.id;
+    UPDATE public.wallets SET balance = v_target_balance_after, updated_at = NOW() WHERE id = v_target_wallet.id;
+    UPDATE public.card_transactions SET status = 'SETTLED', settled_at = NOW(), updated_at = NOW() WHERE id = p_card_transaction_id;
 
-    IF COALESCE(p_fee_amount, 0) > 0 THEN
-        IF v_fee_wallet.id IS NOT NULL THEN
-            UPDATE public.wallets
-               SET balance = v_fee_balance_after,
-                   updated_at = NOW()
-             WHERE id = v_fee_wallet.id;
-        ELSE
-            UPDATE public.platform_vaults
-               SET balance = v_fee_balance_after,
-                   updated_at = NOW()
-             WHERE id = v_fee_vault.id;
-        END IF;
-    END IF;
-
-    UPDATE public.card_transactions
-       SET status = 'SETTLED',
-           settled_at = NOW(),
-           updated_at = NOW()
-     WHERE id = p_card_transaction_id;
-
-    RETURN jsonb_build_object(
-        'success', true,
-        'settlement_id', v_financial_tx.id,
-        'transaction_id', p_card_transaction_id,
-        'amount', COALESCE(v_card_tx.amount, 0),
-        'fee', COALESCE(p_fee_amount, 0),
-        'target_balance_after', v_target_balance_after,
-        'fee_balance_after', v_fee_balance_after,
-        'status', 'COMPLETED'
-    );
+    RETURN jsonb_build_object('success', true, 'settlement_id', v_financial_tx.id, 'transaction_id', p_card_transaction_id, 'amount', COALESCE(v_card_tx.amount, 0), 'fee', COALESCE(p_fee_amount, 0), 'target_balance_after', v_target_balance_after, 'fee_balance_after', v_fee_balance_after, 'service_revenue_vault_id', CASE WHEN p_fee_amount > 0 THEN v_service_revenue_vault.id ELSE NULL END, 'status', 'COMPLETED');
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
@@ -7747,8 +7601,8 @@ DECLARE
     v_merchant public.merchants%ROWTYPE;
     v_escrow_vault public.platform_vaults%ROWTYPE;
     v_merchant_wallet public.merchant_wallets%ROWTYPE;
-    v_fee_collector public.fee_collector_wallets%ROWTYPE;
-    v_fee_vault public.platform_vaults%ROWTYPE;
+    v_service_revenue_vault public.platform_vaults%ROWTYPE;
+    v_tax_reserve_vault public.platform_vaults%ROWTYPE;
     v_settlement_config_id UUID;
     v_fee_snapshot JSONB;
     v_fee_config_id UUID;
@@ -7759,7 +7613,8 @@ DECLARE
     v_net NUMERIC;
     v_next_escrow_balance NUMERIC;
     v_next_merchant_balance NUMERIC;
-    v_next_fee_balance NUMERIC;
+    v_next_service_revenue_balance NUMERIC;
+    v_next_tax_reserve_balance NUMERIC;
     v_append_key TEXT;
     v_existing public.merchant_paysafe_settlements%ROWTYPE;
 BEGIN
@@ -7900,35 +7755,37 @@ BEGIN
         RAISE EXCEPTION 'PAYSAFE_ESCROW_BALANCE_INSUFFICIENT';
     END IF;
 
-    IF v_total_fee > 0 THEN
-        SELECT fcw.* INTO v_fee_collector
-        FROM public.fee_collector_wallets fcw
-        WHERE UPPER(COALESCE(fcw.currency, 'TZS')) = UPPER(v_agreement.currency)
-          AND LOWER(fcw.fee_type) IN ('platform_fee', 'service_fee', 'merchant_fee')
-        ORDER BY
-          CASE LOWER(fcw.fee_type)
-            WHEN 'merchant_fee' THEN 0
-            WHEN 'platform_fee' THEN 1
-            ELSE 2
-          END,
-          fcw.created_at
-        LIMIT 1
-        FOR UPDATE;
-
-        IF NOT FOUND OR v_fee_collector.vault_id IS NULL THEN
-            RAISE EXCEPTION 'PAYSAFE_FEE_COLLECTOR_UNAVAILABLE';
-        END IF;
-
-        SELECT pv.* INTO v_fee_vault
-        FROM public.platform_vaults pv
-        WHERE pv.id = v_fee_collector.vault_id
-          AND UPPER(COALESCE(pv.currency, 'TZS')) = UPPER(v_agreement.currency)
+    IF v_service_fee > 0 THEN
+        SELECT pv.* INTO v_service_revenue_vault
+        FROM public.system_settlement_accounts ssa
+        JOIN public.platform_vaults pv ON pv.id = ssa.vault_id
+        WHERE ssa.role = 'SERVICE_REVENUE'
+          AND ssa.currency = UPPER(v_agreement.currency)
+          AND ssa.status = 'ACTIVE'
+          AND UPPER(COALESCE(pv.currency, '')) = UPPER(v_agreement.currency)
           AND NOT COALESCE(pv.is_locked, FALSE)
-          AND LOWER(COALESCE(pv.status, 'active')) NOT IN ('locked', 'frozen', 'blocked', 'suspended')
-        FOR UPDATE;
+          AND LOWER(COALESCE(pv.status, 'active')) = 'active'
+        FOR UPDATE OF pv;
 
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'PAYSAFE_FEE_COLLECTOR_UNAVAILABLE';
+            RAISE EXCEPTION 'PAYSAFE_SERVICE_REVENUE_ACCOUNT_UNAVAILABLE:%', UPPER(v_agreement.currency);
+        END IF;
+    END IF;
+
+    IF v_tax > 0 THEN
+        SELECT pv.* INTO v_tax_reserve_vault
+        FROM public.system_settlement_accounts ssa
+        JOIN public.platform_vaults pv ON pv.id = ssa.vault_id
+        WHERE ssa.role = 'TAX_RESERVE'
+          AND ssa.currency = UPPER(v_agreement.currency)
+          AND ssa.status = 'ACTIVE'
+          AND UPPER(COALESCE(pv.currency, '')) = UPPER(v_agreement.currency)
+          AND NOT COALESCE(pv.is_locked, FALSE)
+          AND LOWER(COALESCE(pv.status, 'active')) = 'active'
+        FOR UPDATE OF pv;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'PAYSAFE_TAX_RESERVE_ACCOUNT_UNAVAILABLE:%', UPPER(v_agreement.currency);
         END IF;
     END IF;
 
@@ -7962,38 +7819,33 @@ BEGIN
     WHERE id = v_merchant_wallet.id;
 
     INSERT INTO public.financial_ledger (
-        transaction_id, user_id, wallet_id, entry_type, amount, balance_after, description
+        transaction_id, user_id, wallet_id, entry_type, amount, balance_after, description, currency
     ) VALUES
         (
             v_tx.id, v_agreement.sender_id, v_escrow_vault.id, 'DEBIT',
             v_gross::TEXT, v_next_escrow_balance::TEXT,
-            'PaySafe merchant settlement debit: ' || p_reference_id
+            'PaySafe merchant settlement debit: ' || p_reference_id,
+            UPPER(v_agreement.currency)
         ),
         (
             v_tx.id, v_merchant.owner_user_id, v_merchant_wallet.id, 'CREDIT',
             v_net::TEXT, v_next_merchant_balance::TEXT,
-            'PaySafe merchant net settlement: ' || p_reference_id
+            'PaySafe merchant net settlement: ' || p_reference_id,
+            UPPER(v_agreement.currency)
         );
 
-    IF v_total_fee > 0 THEN
-        v_next_fee_balance := ROUND((COALESCE(v_fee_vault.balance, 0) + v_total_fee)::NUMERIC, 2);
+    IF v_service_fee > 0 THEN
+        v_next_service_revenue_balance := ROUND((COALESCE(v_service_revenue_vault.balance, 0) + v_service_fee)::NUMERIC, 2);
+        UPDATE public.platform_vaults SET balance = v_next_service_revenue_balance, updated_at = v_now WHERE id = v_service_revenue_vault.id;
+        INSERT INTO public.financial_ledger (transaction_id, user_id, wallet_id, entry_type, amount, balance_after, description, currency)
+        VALUES (v_tx.id, v_service_revenue_vault.user_id, v_service_revenue_vault.id, 'CREDIT', v_service_fee::TEXT, v_next_service_revenue_balance::TEXT, 'PaySafe merchant service revenue: ' || p_reference_id, UPPER(v_agreement.currency));
+    END IF;
 
-        UPDATE public.platform_vaults
-        SET balance = v_next_fee_balance, updated_at = v_now
-        WHERE id = v_fee_vault.id;
-
-        UPDATE public.fee_collector_wallets
-        SET balance = ROUND((COALESCE(balance, 0) + v_total_fee)::NUMERIC, 2),
-            updated_at = v_now
-        WHERE id = v_fee_collector.id;
-
-        INSERT INTO public.financial_ledger (
-            transaction_id, user_id, wallet_id, entry_type, amount, balance_after, description
-        ) VALUES (
-            v_tx.id, v_fee_vault.user_id, v_fee_vault.id, 'CREDIT',
-            v_total_fee::TEXT, v_next_fee_balance::TEXT,
-            'PaySafe merchant fee settlement: ' || p_reference_id
-        );
+    IF v_tax > 0 THEN
+        v_next_tax_reserve_balance := ROUND((COALESCE(v_tax_reserve_vault.balance, 0) + v_tax)::NUMERIC, 2);
+        UPDATE public.platform_vaults SET balance = v_next_tax_reserve_balance, updated_at = v_now WHERE id = v_tax_reserve_vault.id;
+        INSERT INTO public.financial_ledger (transaction_id, user_id, wallet_id, entry_type, amount, balance_after, description, currency)
+        VALUES (v_tx.id, v_tax_reserve_vault.user_id, v_tax_reserve_vault.id, 'CREDIT', v_tax::TEXT, v_next_tax_reserve_balance::TEXT, 'PaySafe merchant statutory tax reserve: ' || p_reference_id, UPPER(v_agreement.currency));
     END IF;
 
     INSERT INTO public.merchant_paysafe_settlements (
@@ -8003,6 +7855,8 @@ BEGIN
         owner_user_id,
         merchant_wallet_id,
         fee_collector_wallet_id,
+        service_revenue_vault_id,
+        tax_reserve_vault_id,
         fee_config_id,
         gross_amount,
         fee_amount,
@@ -8018,7 +7872,9 @@ BEGIN
         v_merchant.id,
         v_merchant.owner_user_id,
         v_merchant_wallet.id,
-        CASE WHEN v_total_fee > 0 THEN v_fee_collector.id ELSE NULL END,
+        NULL,
+        CASE WHEN v_service_fee > 0 THEN v_service_revenue_vault.id ELSE NULL END,
+        CASE WHEN v_tax > 0 THEN v_tax_reserve_vault.id ELSE NULL END,
         v_fee_config_id,
         v_gross,
         v_service_fee,
@@ -8030,6 +7886,8 @@ BEGIN
         jsonb_build_object(
             'reference_id', p_reference_id,
             'fee_snapshot', v_fee_snapshot,
+            'service_revenue_vault_id', CASE WHEN v_service_fee > 0 THEN v_service_revenue_vault.id ELSE NULL END,
+            'tax_reserve_vault_id', CASE WHEN v_tax > 0 THEN v_tax_reserve_vault.id ELSE NULL END,
             'settled_by', p_actor_id
         )
     )
@@ -11459,15 +11317,3 @@ BEGIN
     END LOOP;
   END LOOP;
 END $$;
-
--- Legacy fee aliases remain for old reports, but their TZS mappings now point
--- to the correctly denominated company accounts.
-UPDATE public.fee_collector_wallets fcw
-SET vault_id = ssa.vault_id, currency = 'TZS', updated_at = NOW()
-FROM public.system_settlement_accounts ssa
-WHERE fcw.fee_type = 'SERVICE_FEE' AND ssa.role = 'SERVICE_REVENUE' AND ssa.currency = 'TZS';
-
-UPDATE public.fee_collector_wallets fcw
-SET vault_id = ssa.vault_id, currency = 'TZS', updated_at = NOW()
-FROM public.system_settlement_accounts ssa
-WHERE fcw.fee_type = 'GOV_TAX' AND ssa.role = 'TAX_RESERVE' AND ssa.currency = 'TZS';

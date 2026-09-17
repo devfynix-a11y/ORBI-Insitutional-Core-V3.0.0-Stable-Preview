@@ -25,7 +25,7 @@ export class RegulatoryServiceNode {
      * RESOLVE SYSTEM NODE
      * Maps logical system roles (like ESCROW) to physical wallet/vault IDs.
      */
-    public async resolveSystemNode(role: 'ESCROW_VAULT' | 'FEE_COLLECTOR' | 'TAX_RESERVE' | 'FX_CLEARING'): Promise<string> {
+    public async resolveSystemNode(role: 'ESCROW_VAULT' | 'TAX_RESERVE' | 'FX_CLEARING'): Promise<string> {
         const sb = getSupabase();
         
         if (sb) {

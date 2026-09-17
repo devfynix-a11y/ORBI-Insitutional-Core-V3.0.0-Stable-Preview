@@ -8,6 +8,7 @@ import { getSupabase } from '../supabaseClient.js';
 import { Audit } from '../security/audit.js';
 import { UUID } from '../../services/utils.js';
 import { platformFeeService } from './PlatformFeeService.js';
+import { systemSettlementAccounts } from '../ledger/SystemSettlementAccountService.js';
 import { TransactionService } from '../../ledger/transactionService.js';
 
 export enum SettlementPhase {
@@ -571,11 +572,6 @@ export class SettlementLifecycleManager {
         throw new Error('SETTLEMENT_SOURCE_WALLET_REQUIRED');
       }
 
-      const feeWalletId = String(process.env.SYSTEM_FEE_WALLET_ID || '').trim();
-      if (!feeWalletId) {
-        throw new Error('SYSTEM_FEE_WALLET_REQUIRED');
-      }
-
       const financialTxId = UUID.generate();
       const settlementCurrency = String(settlement.currency || '').trim().toUpperCase();
       if (!settlementCurrency) throw new Error('SETTLEMENT_CURRENCY_REQUIRED');
@@ -592,6 +588,9 @@ export class SettlementLifecycleManager {
         },
       });
       const platformFee = gatewayFee.serviceFee;
+      const feeWalletId = Number(platformFee || 0) > 0
+        ? await systemSettlementAccounts.resolve('SERVICE_REVENUE', settlementCurrency)
+        : null;
 
       const ledgerLegs = [
         {
@@ -612,7 +611,7 @@ export class SettlementLifecycleManager {
           transactionId: financialTxId,
           timestamp,
         },
-        {
+        ...(feeWalletId ? [{
           walletId: feeWalletId,
           type: 'CREDIT' as const,
           amount: Number(platformFee || 0),
@@ -620,7 +619,7 @@ export class SettlementLifecycleManager {
           description: `Gateway settlement fee from ${settlement.provider_id}`,
           transactionId: financialTxId,
           timestamp,
-        },
+        }] : []),
       ];
 
       await this.ledger.postTransactionWithLedger(

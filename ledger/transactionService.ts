@@ -1809,10 +1809,20 @@ export class TransactionService {
         if (!sb) return [];
 
         try {
-            // 1. Get all fee collector wallet IDs
-            let query = sb.from('fee_collector_wallets').select('fee_type, vault_id');
+            // 1. Resolve company settlement accounts. Legacy fee-collector aliases
+            // are deliberately excluded so reporting cannot resurrect an old vault.
+            const roleByFeeType: Record<string, string> = {
+                SERVICE_FEE: 'SERVICE_REVENUE',
+                PLATFORM_FEE: 'SERVICE_REVENUE',
+                MERCHANT_FEE: 'SERVICE_REVENUE',
+                GOV_TAX: 'TAX_RESERVE',
+                TAX: 'TAX_RESERVE',
+            };
+            let query = sb.from('system_settlement_accounts').select('role, vault_id').eq('status', 'ACTIVE');
             if (feeType) {
-                query = query.eq('fee_type', feeType);
+                const role = roleByFeeType[String(feeType).trim().toUpperCase()];
+                if (!role) throw new Error(`FEE_REPORT_ROLE_UNSUPPORTED:${feeType}`);
+                query = query.eq('role', role);
             }
             const { data: feeWallets, error: walletError } = await query;
             if (walletError || !feeWallets) return [];
