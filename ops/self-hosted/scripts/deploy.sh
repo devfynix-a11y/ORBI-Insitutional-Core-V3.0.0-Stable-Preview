@@ -39,7 +39,11 @@ else
   echo "WARNING: ORBI_SKIP_RELEASE_GATE=true. Deployment is bypassing sandbox release evidence." >&2
 fi
 
-docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" build --pull core
+if [[ "${ORBI_CORE_REFRESH_BASE_IMAGE:-false}" == "true" ]]; then
+  docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" build --pull core
+else
+  docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" build core
+fi
 # Core is released independently. Gateway has its own deployment lifecycle and must not be recreated by a Core release.
 docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" up -d --no-deps core
 

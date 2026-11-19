@@ -23,7 +23,8 @@ test('Core deployment never pulls or recreates unrelated services', () => {
     new URL('../ops/self-hosted/scripts/deploy.sh', import.meta.url),
     'utf8',
   );
-  assert.match(deploy, /build --pull core/);
+  assert.match(deploy, /ORBI_CORE_REFRESH_BASE_IMAGE/);
+  assert.match(deploy, /build core/);
   assert.match(deploy, /up -d --no-deps core/);
   assert.doesNotMatch(deploy, /pull --ignore-buildable/);
   assert.doesNotMatch(deploy, /up -d --remove-orphans/);
