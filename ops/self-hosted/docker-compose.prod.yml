@@ -250,7 +250,7 @@ services:
       - /tmp:size=256m,mode=1777
     volumes:
       - ${ORBI_CORE_TLS_CERT_DIRECTORY:-/srv/orbi/secrets/mtls/core}:/etc/orbi/tls:ro
-      - /srv/orbi/backups/database:/srv/orbi/backups/database:ro
+      - ${ORBI_BACKUP_HOST_DIRECTORY:-/srv/orbi/backups/database}:/srv/orbi/backups/database:ro
       - orbi_public_uploads:/app/public/uploads
     mem_limit: 6g
     cpus: 3.0
@@ -659,7 +659,7 @@ services:
     entrypoint: ["/bin/sh", "/opt/orbi/backup-postgres.sh"]
     volumes:
       - ./Backup_Recovery/backup-postgres.sh:/opt/orbi/backup-postgres.sh:ro
-      - /srv/orbi/backups/database:/backups
+      - ${ORBI_BACKUP_HOST_DIRECTORY:-/srv/orbi/backups/database}:/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -685,7 +685,7 @@ services:
     entrypoint: ["/bin/sh", "/opt/orbi/backup-r2-mirror.sh"]
     volumes:
       - ./Backup_Recovery/backup-r2-mirror.sh:/opt/orbi/backup-r2-mirror.sh:ro
-      - /srv/orbi/backups/database:/backups:ro
+      - ${ORBI_BACKUP_HOST_DIRECTORY:-/srv/orbi/backups/database}:/backups:ro
     depends_on:
       database-backup:
         condition: service_started
