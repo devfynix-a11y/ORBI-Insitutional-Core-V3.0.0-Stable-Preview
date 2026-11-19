@@ -22,3 +22,19 @@ test('treasury concurrency certification covers isolation, quorum, and single ap
   assert.match(mutation, /originalGoalBalance - amount/);
   assert.match(mutation, /originalDestinationBalance \+ amount/);
 });
+
+test('Windows financial test helper cannot point fixtures at the live database', () => {
+  const helper = readFileSync(
+    new URL('../ops/self-hosted/scripts/test-local-financial-db-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  const runner = readFileSync(
+    new URL('../scripts/run-db-financial-tests.mjs', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(helper, /\.env\.test\.local/);
+  assert.doesNotMatch(helper, /127\.0\.0\.1:5432\/\$\{database\}/);
+  assert.match(runner, /orbi_treasury_certification/);
+  assert.match(runner, /Write mode refused/);
+});

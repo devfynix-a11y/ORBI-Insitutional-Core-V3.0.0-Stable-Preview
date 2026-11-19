@@ -96,6 +96,18 @@ if (mode === 'write') {
     console.error('[db-financial-runner] Write mode refused. The dedicated env file must set ORBI_DB_TEST_DISPOSABLE=true.');
     process.exit(1);
   }
+  const fixtureUrl = String(childEnv.ORBI_DB_INTEGRATION_DATABASE_URL || childEnv.DATABASE_URL || '').trim();
+  let databaseName = '';
+  try {
+    databaseName = new URL(fixtureUrl).pathname.replace(/^\/+/, '');
+  } catch {
+    console.error('[db-financial-runner] Write mode refused. The disposable database URL is invalid.');
+    process.exit(1);
+  }
+  if (databaseName !== 'orbi_treasury_certification') {
+    console.error('[db-financial-runner] Write mode refused. Financial fixture writes are restricted to orbi_treasury_certification.');
+    process.exit(1);
+  }
 }
 
 const validationMode = mode === 'write' ? 'write' : 'read';

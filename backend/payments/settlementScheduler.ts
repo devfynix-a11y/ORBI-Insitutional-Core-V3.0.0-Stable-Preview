@@ -363,7 +363,6 @@ export class SettlementScheduler {
       SettlementPhase.EXTERNAL_PENDING,
       SettlementPhase.RECONCILIATION_RUNNING,
       SettlementPhase.READY_FOR_INTERNAL_COMMIT,
-      SettlementPhase.FAILED,
       SettlementPhase.DISPUTE_UNDER_REVIEW,
     ];
 
@@ -372,7 +371,13 @@ export class SettlementScheduler {
       const { count } = await this.client
         .from('settlement_lifecycle')
         .select('*', { count: 'exact', head: true })
-        .eq('current_phase', phase);
+        // A backlog represents work that can still move money. Completed,
+        // failed, cancelled, and zero-value test rows are retained for audit
+        // but must not make operational health look as if a live settlement is
+        // waiting for execution.
+        .eq('current_phase', phase)
+        .eq('status', 'ACTIVE')
+        .gt('amount', 0);
 
       pendingCount[phase] = count || 0;
     }
