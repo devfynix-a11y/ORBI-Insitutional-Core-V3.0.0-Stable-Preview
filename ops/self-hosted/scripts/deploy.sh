@@ -39,26 +39,43 @@ else
   echo "WARNING: ORBI_SKIP_RELEASE_GATE=true. Deployment is bypassing sandbox release evidence." >&2
 fi
 
+# Some hosts still run the established self-hosted stack. Its Core container is
+# attached to named live networks; release into that project instead of creating
+# a parallel Compose project with empty DNS/service discovery.
+compose_args=(--profile direct-edge --env-file "${env_file}" -f "${compose}")
+existing_project="$(docker inspect orbi-core --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)"
+if [[ "${existing_project}" == "self-hosted" ]]; then
+  legacy_env_file="${root}/.env"
+  [[ -f "${legacy_env_file}" ]] || { echo "Existing self-hosted Core is missing ${legacy_env_file}." >&2; exit 1; }
+  compose_args=(
+    -p self-hosted
+    --env-file "${legacy_env_file}"
+    -f "${root}/ops/self-hosted/docker-compose.dev.yml"
+    -f "${root}/ops/self-hosted/Auth_Security/docker-compose.yml"
+    -f "${root}/ops/self-hosted/Storage/docker-compose.yml"
+  )
+  echo "Deploying Core into the established self-hosted live stack."
+fi
+
 if [[ "${ORBI_CORE_REFRESH_BASE_IMAGE:-false}" == "true" ]]; then
-  docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" build --pull core
+  docker compose "${compose_args[@]}" build --pull core
 else
-  docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" build core
+  docker compose "${compose_args[@]}" build core
 fi
 # Core is released independently. Gateway has its own deployment lifecycle and must not be recreated by a Core release.
-docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" up -d --no-deps core
-
+docker compose "${compose_args[@]}" up -d --no-deps core
 echo "Waiting for Core health..."
 for _ in $(seq 1 60); do
-  if docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" exec -T core \
+  if docker compose "${compose_args[@]}" exec -T core \
     node -e "fetch('http://127.0.0.1:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
-    docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" ps
+    docker compose "${compose_args[@]}" ps
     echo "ORBI deployment is healthy."
     exit 0
   fi
   sleep 5
 done
 
-docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" ps
-docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" logs --tail=200 core postgres valkey
+docker compose "${compose_args[@]}" ps
+docker compose "${compose_args[@]}" logs --tail=200 core postgres valkey
 echo "Deployment did not become ready." >&2
 exit 1

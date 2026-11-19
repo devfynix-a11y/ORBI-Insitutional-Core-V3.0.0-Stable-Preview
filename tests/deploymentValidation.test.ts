@@ -24,6 +24,8 @@ test('Core deployment never pulls or recreates unrelated services', () => {
     'utf8',
   );
   assert.match(deploy, /ORBI_CORE_REFRESH_BASE_IMAGE/);
+  assert.match(deploy, /existing_project.*self-hosted/);
+  assert.match(deploy, /docker-compose\.dev\.yml/);
   assert.match(deploy, /build core/);
   assert.match(deploy, /up -d --no-deps core/);
   assert.doesNotMatch(deploy, /pull --ignore-buildable/);
