@@ -20,11 +20,11 @@ function Get-ContainerEnvMap([string]$ContainerName) {
   $map
 }
 
-function Invoke-PostgresFile([string]$Database, [string]$Sql) {
+function Invoke-PostgresFile([string]$ContainerName, [string]$Database, [string]$User, [string]$Sql) {
   $temp = [System.IO.Path]::GetTempFileName()
   try {
     Set-Content -LiteralPath $temp -Value $Sql -Encoding UTF8
-    Get-Content -LiteralPath $temp -Raw | docker exec -i orbi-postgres psql -U orbi -d $Database -v ON_ERROR_STOP=1
+    Get-Content -LiteralPath $temp -Raw | docker exec -i $ContainerName psql -U $User -d $Database -v ON_ERROR_STOP=1
     if ($LASTEXITCODE -ne 0) {
       throw "PostgreSQL fixture load failed for database '$Database'."
     }
@@ -47,6 +47,18 @@ if (-not $gatewayEnv.Contains("PAYMENT_GATEWAY_OPERATOR_DISCOVERY_API_KEY")) {
   throw "PAYMENT_GATEWAY_OPERATOR_DISCOVERY_API_KEY not found on orbi-pay-gateway-sandbox."
 }
 $operatorKey = $gatewayEnv["PAYMENT_GATEWAY_OPERATOR_DISCOVERY_API_KEY"]
+$corePostgresEnv = Get-ContainerEnvMap "orbi-postgres-sandbox-1"
+$gatewayPostgresEnv = Get-ContainerEnvMap "orbi-pay-gateway-postgres-sandbox"
+
+if (
+  -not $corePostgresEnv.Contains("POSTGRES_USER") -or
+  -not $gatewayPostgresEnv.Contains("POSTGRES_USER")
+) {
+  throw "Sandbox PostgreSQL credentials are not available from the sandbox containers."
+}
+
+$corePostgresUser = $corePostgresEnv["POSTGRES_USER"]
+$gatewayPostgresUser = $gatewayPostgresEnv["POSTGRES_USER"]
 
 $coreSql = @'
 create extension if not exists pgcrypto;
@@ -61,6 +73,28 @@ declare
   now_utc timestamptz := now();
   fee_flow text;
 begin
+  -- The Core simulator uses its own sandbox database. Mirror only the
+  -- non-secret service authorization record here; API keys and webhook
+  -- secrets remain exclusively in the isolated Pay Gateway database.
+  insert into public.pay_gateway_developer_services (
+    service_code, display_name, legal_name, business_type, country_code,
+    contact_email, contact_phone, status, environments, scopes_granted,
+    external_developer_id, metadata, created_at, updated_at
+  ) values (
+    'orbi-shop-sandbox', 'ORBI Shop Sandbox', 'ORBI Shop Sandbox Limited',
+    'marketplace', 'TZ', 'sandbox-shop@orbifinancial.test', '+255700000303',
+    'active', array['sandbox'],
+    array['identity:resolve','payment_profile:create','payment_profile:read','payments:create','escrow:create','escrow:read','escrow:release:request','escrow:refund:request','escrow:dispute:create','webhooks:receive'],
+    'sandbox-orbi-shop',
+    jsonb_build_object('sandbox', true, 'coreMerchantId', merchant_id::text, 'fixture', 'release-gate'),
+    now_utc, now_utc
+  ) on conflict (service_code) do update set
+    status = excluded.status,
+    environments = excluded.environments,
+    scopes_granted = excluded.scopes_granted,
+    metadata = excluded.metadata,
+    updated_at = now_utc;
+
   insert into auth.users (
     id, aud, role, email, phone, encrypted_password, email_confirmed_at,
     phone_confirmed_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at
@@ -360,7 +394,7 @@ begin
 end $$;
 '@
 
-Invoke-PostgresFile $CoreDatabase $coreSql
+Invoke-PostgresFile "orbi-postgres-sandbox-1" $CoreDatabase $corePostgresUser $coreSql
 
 $serviceCode = "orbi-shop-sandbox"
 $applicationBody = @{
@@ -438,7 +472,7 @@ $serviceMetadata = @'
 '@
 $serviceMetadata = ($serviceMetadata -replace "\s+", "").Replace("'", "''")
 $serviceScopes = ($applicationBody.requestedScopes | ConvertTo-Json -Compress).Replace("'", "''")
-Invoke-PostgresFile $GatewayDatabase @"
+Invoke-PostgresFile "orbi-pay-gateway-postgres-sandbox" $GatewayDatabase $gatewayPostgresUser @"
 update public.pay_gateway_developer_services
 set metadata = coalesce(metadata, '{}'::jsonb) || '$serviceMetadata'::jsonb,
     scopes_granted = (
@@ -453,6 +487,10 @@ set metadata = coalesce(metadata, '{}'::jsonb) || '$serviceMetadata'::jsonb,
 where service_code = '$serviceCode';
 "@
 
+# The database update above grants the deterministic fixture scopes. Reload the
+# service before deciding whether a request is needed, otherwise a repeated
+# release gate sees stale scope data and creates an unnecessary pending request.
+$service = (Invoke-Gateway "GET" "/v1/developer/services/$serviceCode").data
 foreach ($scope in $applicationBody.requestedScopes) {
   if ($service.scopesGranted -notcontains $scope) {
     $scopeRequest = Invoke-Gateway "POST" "/v1/developer/services/$serviceCode/scope-requests" @{
@@ -502,7 +540,7 @@ if ($RotateSecrets -or -not $activeWebhookSecret) {
   $activeWebhookSecret = $secretResult.data.webhookSecret
 }
 
-Invoke-PostgresFile $GatewayDatabase @"
+Invoke-PostgresFile "orbi-pay-gateway-postgres-sandbox" $GatewayDatabase $gatewayPostgresUser @"
 update public.pay_gateway_developer_services
 set metadata = coalesce(metadata, '{}'::jsonb) || '$serviceMetadata'::jsonb,
     scopes_granted = (

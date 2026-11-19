@@ -13,7 +13,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
-    networks: [orbi_private]
+    networks: [orbi_sandbox_private]
 
   keycloak-sandbox:
     profiles: [sandbox]
@@ -47,10 +47,8 @@ services:
       retries: 30
       start_period: 45s
     networks:
-      orbi_private:
+      orbi_sandbox_private:
         aliases: [orbi-keycloak-sandbox]
-      orbi_edge:
-        aliases: [keycloak-sandbox]
 
   pay-gateway-postgres-live:
     profiles: [live]
@@ -82,7 +80,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
-    networks: [orbi_private]
+    networks: [orbi_sandbox_private]
 
   pay-gateway:
     profiles:
@@ -187,6 +185,9 @@ services:
       PAYMENT_GATEWAY_PROVIDER_MANIFEST_PATH: /app/config/providers.json
       PAYMENT_GATEWAY_SERVICE_REGISTRY_PATH: /app/config/services.json
       PAYMENT_GATEWAY_OBP_SANDBOX_TOOLS_ENABLED: "true"
+      PAYMENT_GATEWAY_PROMOTION_ISSUER: ${PAYMENT_GATEWAY_PROMOTION_ISSUER:-orbi-pay-sandbox}
+      PAYMENT_GATEWAY_PROMOTION_AUDIENCE: ${PAYMENT_GATEWAY_PROMOTION_AUDIENCE:-orbi-pay-live-promotion}
+      PAYMENT_GATEWAY_PROMOTION_TTL_SECONDS: ${PAYMENT_GATEWAY_PROMOTION_TTL_SECONDS:-300}
       PAYMENT_GATEWAY_RECONCILIATION_EXPORT_PATH: /app/reconciliation
       PAYMENT_GATEWAY_RECONCILIATION_SCHEDULE_ENABLED: "true"
       PAYMENT_GATEWAY_RECONCILIATION_SCHEDULE_INTERVAL_MINUTES: "1440"
@@ -236,9 +237,8 @@ services:
       retries: 20
       start_period: 30s
     networks:
-      - orbi_private
-      - orbi_edge
       - orbi_sandbox_private
+      - orbi_sandbox_test_bridge
 
 networks:
   orbi_private:
@@ -249,6 +249,9 @@ networks:
     external: true
   orbi_sandbox_private:
     name: orbi_sandbox_private
+    external: true
+  orbi_sandbox_test_bridge:
+    name: orbi_sandbox_test_bridge
     external: true
 
 volumes:

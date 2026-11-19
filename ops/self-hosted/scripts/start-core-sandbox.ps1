@@ -47,7 +47,10 @@ function Invoke-Postgres([string]$Database, [string]$Sql) {
   docker exec orbi-postgres psql -U orbi -d $Database -v ON_ERROR_STOP=1 -c $Sql | Out-Null
 }
 
-$liveCoreEnv = Get-ContainerEnvMap "orbi-core"
+# The compose-managed sandbox Core is the source of sandbox-only endpoints,
+# credentials, database and cache URLs. Do not rewrite a live Core URL: that
+# would silently weaken the isolation the release gate is meant to verify.
+$sandboxCoreEnv = Get-ContainerEnvMap "orbi-core-sandbox-1"
 $workerSigningSecret = Get-OrCreateSecretFile $SandboxWorkerSecretPath 96
 $workerSecret = Get-OrCreateSecretFile "$SandboxSecretPrefix-worker-secret.txt" 96
 $jwtSecret = Get-OrCreateSecretFile "$SandboxSecretPrefix-jwt-secret.txt" 96
@@ -57,30 +60,21 @@ $kmsMasterSalt = Get-OrCreateSecretFile "$SandboxSecretPrefix-kms-master-salt.tx
 $bootstrapAdminSecret = Get-OrCreateSecretFile "$SandboxSecretPrefix-bootstrap-admin-secret.txt" 64
 $monitorApiKey = Get-OrCreateSecretFile "$SandboxSecretPrefix-monitor-api-key.txt" 64
 
-if (-not $liveCoreEnv.Contains("DATABASE_URL")) {
-  throw "DATABASE_URL not found on orbi-core."
+if (-not $sandboxCoreEnv.Contains("DATABASE_URL")) {
+  throw "DATABASE_URL not found on the compose-managed sandbox Core."
 }
 
-$sandboxDatabaseUrl = $liveCoreEnv["DATABASE_URL"] -replace "/orbi(\?.*)?$", "/$SandboxDatabase`$1"
-if ($sandboxDatabaseUrl -eq $liveCoreEnv["DATABASE_URL"]) {
-  throw "Could not derive sandbox Core database URL safely."
+$sandboxDatabaseUrl = $sandboxCoreEnv["DATABASE_URL"]
+try {
+  $sandboxDatabaseUri = [Uri]$sandboxDatabaseUrl
+} catch {
+  throw "Sandbox Core DATABASE_URL is invalid."
 }
-
-$databaseExists = docker exec orbi-postgres psql -U orbi -d orbi -tAc "select 1 from pg_database where datname = '$SandboxDatabase';"
-if ($databaseExists -and $RebuildSchema) {
-  $activeConnectionsSql = "select pg_terminate_backend(pid) from pg_stat_activity where datname = '$SandboxDatabase';"
-  Invoke-Postgres "orbi" $activeConnectionsSql
-  Invoke-Postgres "orbi" "drop database $SandboxDatabase;"
-  $databaseExists = $null
-}
-if (-not $databaseExists) {
-  Invoke-Postgres "orbi" "create database $SandboxDatabase owner orbi;"
-}
-
-$hasCoreSchemas = docker exec orbi-postgres psql -U orbi -d $SandboxDatabase -tAc "select count(*) from information_schema.schemata where schema_name in ('public', 'orbi_auth');"
-if ([int]$hasCoreSchemas -lt 2) {
-  docker exec orbi-postgres pg_dump -U orbi -d orbi --schema-only |
-    docker exec -i orbi-postgres psql -U orbi -d $SandboxDatabase -v ON_ERROR_STOP=1 | Out-Null
+if (
+  $sandboxDatabaseUri.Host -notmatch 'sandbox' -or
+  $sandboxDatabaseUri.AbsolutePath.Trim('/') -ne $SandboxDatabase
+) {
+  throw "Sandbox Core DATABASE_URL does not target the isolated sandbox database."
 }
 
 $existing = docker ps -a --filter "name=^orbi-core-sandbox$" --format "{{.Names}}"
@@ -89,11 +83,11 @@ if ($existing) {
 }
 
 $envArgs = New-Object System.Collections.Generic.List[string]
-foreach ($key in $liveCoreEnv.Keys) {
+foreach ($key in $sandboxCoreEnv.Keys) {
   if ($key -in @("PATH", "NODE_VERSION", "YARN_VERSION")) {
     continue
   }
-  $value = $liveCoreEnv[$key]
+  $value = $sandboxCoreEnv[$key]
   switch ($key) {
     "NODE_ENV" { $value = "sandbox" }
     "PORT" { $value = "3000" }
@@ -180,7 +174,7 @@ if ($PrintDockerArgs) {
 docker create `
   --name orbi-core-sandbox `
   --restart unless-stopped `
-  --network orbi-private `
+  --network orbi_sandbox_private `
   --network-alias core-sandbox `
   --no-healthcheck `
   @envArgs `
@@ -191,7 +185,7 @@ if ($LASTEXITCODE -ne 0) {
   throw "docker create failed for orbi-core-sandbox."
 }
 
-docker network connect --alias core-sandbox orbi-edge orbi-core-sandbox
+docker network connect orbi_sandbox_test_bridge orbi-core-sandbox
 docker start orbi-core-sandbox | Out-Null
 
 $scheme = if ($EnableDirectMtls) { "https" } else { "http" }

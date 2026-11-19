@@ -42,6 +42,35 @@ function Get-ContainerEnvValue([string]$ContainerName, [string]$Key) {
   $row -replace "^$Key=", ""
 }
 
+function Get-ComposeSandboxGatewayContainerName {
+  $containerName = docker ps -a --filter "label=com.docker.compose.service=pay-gateway-sandbox" --format "{{.Names}}" |
+    Select-Object -First 1
+  if (-not [string]::IsNullOrWhiteSpace($containerName)) {
+    return $containerName.Trim()
+  }
+
+  # The smoke runner replaces the compose container with a deliberately
+  # constrained manual container. Recreate the compose definition only long
+  # enough to read its sandbox-only runtime settings, then replace it again.
+  $manualContainer = docker ps -a --filter "name=^/orbi-pay-gateway-sandbox$" --format "{{.Names}}" |
+    Select-Object -First 1
+  if (-not [string]::IsNullOrWhiteSpace($manualContainer)) {
+    docker rm -f $manualContainer.Trim() | Out-Null
+  }
+
+  $composeFile = Join-Path (Get-Location) "ops\self-hosted\Pay_Gateway\docker-compose.yml"
+  if (-not (Test-Path -LiteralPath $composeFile)) {
+    throw "Sandbox Pay Gateway compose definition was not found: $composeFile"
+  }
+  docker compose -f $composeFile --profile sandbox up -d --no-deps pay-gateway-sandbox | Out-Null
+  $containerName = docker ps -a --filter "label=com.docker.compose.service=pay-gateway-sandbox" --format "{{.Names}}" |
+    Select-Object -First 1
+  if ([string]::IsNullOrWhiteSpace($containerName)) {
+    throw "Compose-managed Pay Gateway sandbox container was not created."
+  }
+  return $containerName.Trim()
+}
+
 function Invoke-Postgres([string]$Database, [string]$Sql) {
   docker exec orbi-postgres psql -U orbi -d $Database -v ON_ERROR_STOP=1 -c $Sql | Out-Null
 }
@@ -60,30 +89,29 @@ if (-not (Test-Path $servicesPath)) {
   throw "Service registry not found: $servicesPath"
 }
 
-$liveDatabaseUrl = Get-ContainerEnvValue "orbi-pay-gateway" "DATABASE_URL"
-$sandboxDatabaseUrl = $liveDatabaseUrl -replace "/orbi(\?.*)?$", "/$SandboxDatabase`$1"
-if ($sandboxDatabaseUrl -eq $liveDatabaseUrl) {
-  throw "Could not derive sandbox database URL safely."
+# The sandbox database is provisioned by the isolated sandbox compose stack.
+# Never derive a test target by rewriting the live gateway URL: its database is
+# on a different PostgreSQL service with separate credentials.
+$composeSandboxGateway = Get-ComposeSandboxGatewayContainerName
+$sandboxDatabaseUrl = Get-ContainerEnvValue $composeSandboxGateway "DATABASE_URL"
+$promotionSigningPrivateKey = Get-ContainerEnvValue $composeSandboxGateway "PAYMENT_GATEWAY_PROMOTION_SIGNING_PRIVATE_KEY"
+try {
+  $sandboxDatabaseUri = [Uri]$sandboxDatabaseUrl
+} catch {
+  throw "Sandbox Pay Gateway DATABASE_URL is invalid."
+}
+if (
+  $sandboxDatabaseUri.Host -notmatch 'sandbox' -or
+  $sandboxDatabaseUri.AbsolutePath.Trim('/') -ne $SandboxDatabase
+) {
+  throw "Sandbox Pay Gateway DATABASE_URL does not target the isolated sandbox database."
 }
 
-$databaseExists = docker exec orbi-postgres psql -U orbi -d orbi -tAc "select 1 from pg_database where datname = '$SandboxDatabase';"
-if (-not $databaseExists) {
-  Invoke-Postgres "orbi" "create database $SandboxDatabase owner orbi;"
-}
-
-$hasDeveloperTables = docker exec orbi-postgres psql -U orbi -d $SandboxDatabase -tAc "select count(*) from information_schema.tables where table_schema = 'public' and table_name like 'pay_gateway_developer_%';"
-if ([int]$hasDeveloperTables -eq 0) {
-  docker exec orbi-postgres pg_dump -U orbi -d orbi --schema-only `
-    -t public.pay_gateway_developer_services `
-    -t public.pay_gateway_developer_api_keys `
-    -t public.pay_gateway_developer_webhook_secrets `
-    -t public.pay_gateway_developer_secret_events |
-    docker exec -i orbi-postgres psql -U orbi -d $SandboxDatabase -v ON_ERROR_STOP=1 | Out-Null
-}
-
-$existing = docker ps -a --filter "name=^orbi-pay-gateway-sandbox$" --format "{{.Names}}"
-if ($existing) {
-  docker rm -f orbi-pay-gateway-sandbox | Out-Null
+@("orbi-pay-gateway-sandbox", $composeSandboxGateway) | Select-Object -Unique | ForEach-Object {
+  $existing = docker ps -a --filter "name=^$($_)$" --format "{{.Names}}"
+  if ($existing) {
+    docker rm -f $_ | Out-Null
+  }
 }
 
 if ($EnableDirectMtls) {
@@ -119,7 +147,7 @@ $gatewayMtlsEnabled = if ($EnableDirectMtls) { "true" } else { "false" }
 docker create `
   --name orbi-pay-gateway-sandbox `
   --restart unless-stopped `
-  --network orbi-private `
+  --network orbi_sandbox_private `
   --network-alias pay-gateway-sandbox `
   -e NODE_ENV=production `
   -e PAYMENT_GATEWAY_PORT=3101 `
@@ -143,6 +171,10 @@ docker create `
   -e PAYMENT_GATEWAY_REQUIRE_SIGNED_INTERNAL_INGRESS=true `
   -e PAYMENT_GATEWAY_REQUEST_AUDIT_ENABLED=true `
   -e PAYMENT_GATEWAY_OBP_SANDBOX_TOOLS_ENABLED=true `
+  -e PAYMENT_GATEWAY_PROMOTION_ISSUER=orbi-pay-sandbox `
+  -e PAYMENT_GATEWAY_PROMOTION_AUDIENCE=orbi-pay-live-promotion `
+  -e PAYMENT_GATEWAY_PROMOTION_TTL_SECONDS=300 `
+  -e PAYMENT_GATEWAY_PROMOTION_SIGNING_PRIVATE_KEY=$promotionSigningPrivateKey `
   -e ORBI_CORE_INTERNAL_BASE_URL=$SandboxCoreUrl `
   -e PAYMENT_GATEWAY_ALLOW_PRIVATE_HTTP_CORE=$allowPrivateHttpCore `
   -e ORBI_CORE_TRUSTED_GATEWAY_EVENT_PATH=/api/internal/gateway/provider-events `
@@ -173,7 +205,7 @@ docker create `
   -p 127.0.0.1:3101:3101 `
   $GatewayImage | Out-Null
 
-docker network connect --alias pay-gateway-sandbox orbi-edge orbi-pay-gateway-sandbox
+docker network connect orbi_sandbox_test_bridge orbi-pay-gateway-sandbox
 docker start orbi-pay-gateway-sandbox | Out-Null
 
 $mode = if ($EnableDirectMtls) { "direct mTLS" } else { "HMAC over private HTTP" }

@@ -420,7 +420,7 @@ services:
   pay-gateway:
     <<: *service-defaults
     build:
-      context: ../../../ORBI PAY GATEWAY
+      context: ../../../../../ORBI GATEWAY/Pay Gateway Backend
       dockerfile: Dockerfile
       args:
         BUILDKIT_INLINE_CACHE: "1"
@@ -443,6 +443,11 @@ services:
       PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID: ${PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID:-orbi-pay-developers}
       PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE: ${PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE:-orbi-pay-api}
       PAYMENT_GATEWAY_OBP_SANDBOX_TOOLS_ENABLED: ${PAYMENT_GATEWAY_OBP_SANDBOX_TOOLS_ENABLED:-false}
+      # Live may verify a sandbox attestation but never receives its signing key.
+      PAYMENT_GATEWAY_PROMOTION_ISSUER: ${PAYMENT_GATEWAY_PROMOTION_ISSUER:-orbi-pay-sandbox}
+      PAYMENT_GATEWAY_PROMOTION_AUDIENCE: ${PAYMENT_GATEWAY_PROMOTION_AUDIENCE:-orbi-pay-live-promotion}
+      PAYMENT_GATEWAY_PROMOTION_TTL_SECONDS: ${PAYMENT_GATEWAY_PROMOTION_TTL_SECONDS:-300}
+      PAYMENT_GATEWAY_PROMOTION_VERIFICATION_PUBLIC_KEY: ${PAYMENT_GATEWAY_PROMOTION_VERIFICATION_PUBLIC_KEY:?Set PAYMENT_GATEWAY_PROMOTION_VERIFICATION_PUBLIC_KEY}
       ORBI_CORE_INTERNAL_BASE_URL: ${ORBI_CORE_INTERNAL_BASE_URL:-http://core:3000}
       PAYMENT_GATEWAY_ALLOW_PRIVATE_HTTP_CORE: ${PAYMENT_GATEWAY_ALLOW_PRIVATE_HTTP_CORE:-true}
       ORBI_CORE_TRUSTED_GATEWAY_EVENT_PATH: ${ORBI_CORE_TRUSTED_GATEWAY_EVENT_PATH:-/api/internal/gateway/provider-events}
@@ -467,9 +472,9 @@ services:
       ORBI_SHOP_PAY_WEBHOOK_URL: ${ORBI_SHOP_PAY_WEBHOOK_URL:-https://shop.orbifinancial.com/api/orbi-pay/webhooks}
       ORBI_SHOP_MERCHANT_ID: ${ORBI_SHOP_MERCHANT_ID}
     volumes:
-      - ../../../ORBI PAY GATEWAY/config/providers.example.json:/app/config/providers.json:ro
-      - ../../../ORBI PAY GATEWAY/config/services.example.json:/app/config/services.json:ro
-      - ${ORBI_PAY_GATEWAY_AUDIT_EVENTS_ROOT:-../../../ORBI GATEWAY/Audit Events/live}:/app/audit
+      - ../../../../../ORBI GATEWAY/Pay Gateway Backend/config/providers.example.json:/app/config/providers.json:ro
+      - ../../../../../ORBI GATEWAY/Pay Gateway Backend/config/services.example.json:/app/config/services.json:ro
+      - ${ORBI_PAY_GATEWAY_AUDIT_EVENTS_ROOT:-../../../../../ORBI GATEWAY/Audit Events/live}:/app/audit
     expose:
       - "3100"
     ports:
@@ -495,7 +500,7 @@ services:
   pay-gateway-sandbox:
     <<: *service-defaults
     build:
-      context: ../../../ORBI PAY GATEWAY
+      context: ../../../../../ORBI GATEWAY/Pay Gateway Backend
       dockerfile: Dockerfile
       args:
         BUILDKIT_INLINE_CACHE: "1"
@@ -518,6 +523,13 @@ services:
       PAYMENT_GATEWAY_OIDC_AUTHORIZATION_CLIENT_ID: ${PAYMENT_GATEWAY_SANDBOX_OIDC_AUTHORIZATION_CLIENT_ID:-orbi-pay-sandbox-developers}
       PAYMENT_GATEWAY_FINANCIAL_TOKEN_AUDIENCE: ${PAYMENT_GATEWAY_SANDBOX_FINANCIAL_TOKEN_AUDIENCE:-orbi-pay-sandbox-api}
       PAYMENT_GATEWAY_OBP_SANDBOX_TOOLS_ENABLED: ${PAYMENT_GATEWAY_SANDBOX_TOOLS_ENABLED:-true}
+      # Sandbox signs a short-lived promotion attestation. The matching public
+      # key is supplied to the live control plane above; the private key never
+      # enters the live gateway container.
+      PAYMENT_GATEWAY_PROMOTION_ISSUER: ${PAYMENT_GATEWAY_PROMOTION_ISSUER:-orbi-pay-sandbox}
+      PAYMENT_GATEWAY_PROMOTION_AUDIENCE: ${PAYMENT_GATEWAY_PROMOTION_AUDIENCE:-orbi-pay-live-promotion}
+      PAYMENT_GATEWAY_PROMOTION_TTL_SECONDS: ${PAYMENT_GATEWAY_PROMOTION_TTL_SECONDS:-300}
+      PAYMENT_GATEWAY_PROMOTION_SIGNING_PRIVATE_KEY: ${PAYMENT_GATEWAY_PROMOTION_SIGNING_PRIVATE_KEY:-}
       ORBI_CORE_INTERNAL_BASE_URL: ${ORBI_CORE_SANDBOX_INTERNAL_BASE_URL:-http://core-sandbox:3001}
       PAYMENT_GATEWAY_ALLOW_PRIVATE_HTTP_CORE: ${PAYMENT_GATEWAY_SANDBOX_ALLOW_PRIVATE_HTTP_CORE:-true}
       ORBI_CORE_TRUSTED_GATEWAY_EVENT_PATH: ${ORBI_CORE_SANDBOX_TRUSTED_GATEWAY_EVENT_PATH:-/api/internal/gateway/provider-events}
@@ -544,9 +556,9 @@ services:
       ORBI_SHOP_PAY_WEBHOOK_URL: ${ORBI_SHOP_SANDBOX_PAY_WEBHOOK_URL:?Set ORBI_SHOP_SANDBOX_PAY_WEBHOOK_URL}
       ORBI_SHOP_MERCHANT_ID: ${ORBI_SHOP_SANDBOX_MERCHANT_ID:?Set ORBI_SHOP_SANDBOX_MERCHANT_ID}
     volumes:
-      - ../../../ORBI PAY GATEWAY/config/providers.example.json:/app/config/providers.json:ro
-      - ../../../ORBI PAY GATEWAY/config/services.example.json:/app/config/services.json:ro
-      - ${ORBI_PAY_GATEWAY_AUDIT_EVENTS_SANDBOX_ROOT:-../../../ORBI GATEWAY/Audit Events/sandbox}:/app/audit
+      - ../../../../../ORBI GATEWAY/Pay Gateway Backend/config/providers.example.json:/app/config/providers.json:ro
+      - ../../../../../ORBI GATEWAY/Pay Gateway Backend/config/services.example.json:/app/config/services.json:ro
+      - ${ORBI_PAY_GATEWAY_AUDIT_EVENTS_SANDBOX_ROOT:-../../../../../ORBI GATEWAY/Audit Events/sandbox}:/app/audit
     expose:
       - "3101"
     ports:

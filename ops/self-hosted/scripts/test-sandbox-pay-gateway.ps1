@@ -378,28 +378,40 @@ $created = Invoke-NodeJson $createScript $gatewayRepoFull
 if (-not $created.success) {
   throw "Checkout create failed. $($created.error) $($created.message)"
 }
-if (-not $created.intentId -or -not $created.otcRequestId -or -not $created.challengeId) {
-  throw "Checkout did not return a hosted OTC challenge. Intent=$($created.intentId) Status=$($created.status)"
+if (-not $created.intentId) {
+  throw "Checkout did not return an intent id. Status=$($created.status)"
 }
 Write-Output "Checkout intent created: $($created.intentId) status=$($created.status)"
 
-$otc = Get-OtcFromValkey $created.otcRequestId
-$challengeUri = "$GatewayBaseUrl/v1/challenges/$($created.intentId)/respond"
-$challengeResponse = Invoke-NoRedirectForm $challengeUri @{
-  challengeId = $created.challengeId
-  decision = "approve"
-  otcCode = $otc
-}
+# The deterministic sandbox simulator may complete a success scenario directly.
+# When a policy requests strong customer authentication, it returns the hosted
+# OTC challenge instead. Both paths must reach the same completed, auditable
+# intent state; only execute the browser-style approval for the latter.
+if ($created.status -ne 'completed') {
+  if (-not $created.otcRequestId -or -not $created.challengeId) {
+    throw "Checkout requires an OTC challenge but none was returned. Intent=$($created.intentId) Status=$($created.status)"
+  }
 
-$statusCode = [int]$challengeResponse.StatusCode
-$location = Get-HeaderValue $challengeResponse.Headers "Location"
-if ($statusCode -lt 300 -or $statusCode -ge 400) {
-  throw "Hosted challenge did not redirect after approval. HTTP $statusCode"
+  $otc = Get-OtcFromValkey $created.otcRequestId
+  $challengeUri = "$GatewayBaseUrl/v1/challenges/$($created.intentId)/respond"
+  $challengeResponse = Invoke-NoRedirectForm $challengeUri @{
+    challengeId = $created.challengeId
+    decision = "approve"
+    otcCode = $otc
+  }
+
+  $statusCode = [int]$challengeResponse.StatusCode
+  $location = Get-HeaderValue $challengeResponse.Headers "Location"
+  if ($statusCode -lt 300 -or $statusCode -ge 400) {
+    throw "Hosted challenge did not redirect after approval. HTTP $statusCode"
+  }
+  if (-not $location -or ($location -notmatch "orbi_payment_status=approved")) {
+    throw "Hosted challenge redirect did not report approved status."
+  }
+  Write-Output "Hosted challenge approved and redirected"
+} else {
+  Write-Output "Sandbox simulator completed the success scenario directly"
 }
-if (-not $location -or ($location -notmatch "orbi_payment_status=approved")) {
-  throw "Hosted challenge redirect did not report approved status."
-}
-Write-Output "Hosted challenge approved and redirected"
 
 $env:ORBI_SMOKE_INTENT_ID = [string]$created.intentId
 $env:ORBI_SMOKE_FINAL_PATH = $finalOutputPath
@@ -517,30 +529,23 @@ const replayMismatch = await valid.payments.createIntent(basePayload(`${replayRe
   idempotencyKey: replayKey,
 });
 
-let decline = null;
-let declineReference = '';
-const declineCustomer = {
-  type: 'user',
-  name: fixture.demoUsers?.[1]?.name || 'Catherine Daniel Sandbox',
-  phone: fixture.demoUsers?.[1]?.phone || '+255700000202',
-};
-for (let attempt = 0; attempt < 3; attempt += 1) {
-  declineReference = `SANDBOX-NEG-DECLINE-${timestamp}-${attempt}`;
-  decline = await valid.payments.checkout(basePayload(declineReference, {
-    customer: declineCustomer,
-  }), {
-    environment: 'Demo',
-    idempotencyKey: `sandbox-neg-decline:${timestamp}:${attempt}`,
-    requestId: `sandbox-neg-decline-${timestamp}-${attempt}`,
-  });
-  const possibleChallenge = decline.data?.coreResult?.challenge || {};
-  if (decline.success && decline.data?.status === 'requires_action' && possibleChallenge.challengeId) {
-    break;
-  }
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-}
-
-const challenge = decline?.data?.coreResult?.challenge || {};
+// The sandbox simulator chooses the requested outcome deterministically. A
+// simulated decline terminates in Core without creating a real customer OTC;
+// customer challenges are exercised only through the live-grade Core path.
+const declineReference = `SANDBOX-NEG-DECLINE-${timestamp}`;
+const decline = await valid.payments.checkout(basePayload(declineReference, {
+  metadata: {
+    sandbox: true,
+    smokeNegativeTest: true,
+    merchantId: fixture.merchantId,
+    serviceCode: fixture.serviceCode,
+    simulationScenario: 'decline',
+  },
+}), {
+  environment: 'Demo',
+  idempotencyKey: `sandbox-neg-decline:${timestamp}`,
+  requestId: `sandbox-neg-decline-${timestamp}`,
+});
 const results = {
   invalidKey: { success: invalidKey.success, error: invalidKey.error || null },
   badRedirect: { success: badRedirect.success, error: badRedirect.error || null },
@@ -555,8 +560,7 @@ const results = {
     success: Boolean(decline?.success),
     intentId: decline?.data?.id || null,
     status: decline?.data?.status || null,
-    challengeId: challenge.challengeId || null,
-    otcRequestId: challenge.metadata?.otcRequestId || null,
+    coreStatus: decline?.data?.coreStatus || null,
     error: decline?.error || null,
   },
 };
@@ -578,19 +582,8 @@ console.log(JSON.stringify(results));
   if ($negative.replay.mismatchSuccess -or $negative.replay.mismatchError -ne "PAYMENT_INTENT_IDEMPOTENCY_MISMATCH") {
     throw "Idempotency mismatch negative test failed. error=$($negative.replay.mismatchError)"
   }
-  if (-not $negative.decline.success -or -not $negative.decline.intentId -or -not $negative.decline.challengeId) {
-    throw "Decline challenge setup failed."
-  }
-
-  $declineOtc = Get-OtcFromValkey $negative.decline.otcRequestId
-  $declineResponse = Invoke-NoRedirectForm "$GatewayBaseUrl/v1/challenges/$($negative.decline.intentId)/respond" @{
-    challengeId = $negative.decline.challengeId
-    decision = "reject"
-    otcCode = $declineOtc
-  }
-  $declineLocation = Get-HeaderValue $declineResponse.Headers "Location"
-  if ([int]$declineResponse.StatusCode -lt 300 -or [int]$declineResponse.StatusCode -ge 400 -or $declineLocation -notmatch "orbi_payment_status=declined") {
-    throw "Decline challenge did not redirect with declined status."
+  if (-not $negative.decline.success -or -not $negative.decline.intentId -or $negative.decline.status -ne 'failed') {
+    throw "Sandbox decline simulation did not produce the required failed terminal state. status=$($negative.decline.status) coreStatus=$($negative.decline.coreStatus) error=$($negative.decline.error)"
   }
   Write-Output "Negative tests OK"
 }

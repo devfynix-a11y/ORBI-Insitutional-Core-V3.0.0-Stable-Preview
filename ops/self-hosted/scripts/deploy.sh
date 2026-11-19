@@ -41,7 +41,8 @@ fi
 
 docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" pull --ignore-buildable
 docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" build --pull core
-docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" up -d --remove-orphans
+# Core is released independently. Gateway has its own deployment lifecycle and must not be recreated by a Core release.
+docker compose --profile direct-edge --env-file "${env_file}" -f "${compose}" up -d --no-deps core
 
 echo "Waiting for Core health..."
 for _ in $(seq 1 60); do
